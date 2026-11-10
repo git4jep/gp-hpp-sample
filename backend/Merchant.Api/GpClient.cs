@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
@@ -13,6 +14,11 @@ public record PaymentLink(string Id, string Url);
 
 public sealed class GpClient(HttpClient http, AppSettings settings)
 {
+    public static HttpClient CreateHttpClient() => new(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+    }) { Timeout = TimeSpan.FromSeconds(15) };
+
     private AccessToken? cached;
     private readonly SemaphoreSlim tokenLock = new(1, 1);
     public static string Secret(string nonce, string appKey) =>

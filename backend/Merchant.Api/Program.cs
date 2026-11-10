@@ -12,7 +12,7 @@ builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 32768);
 var settings = AppSettings.Load();
 builder.Services.AddSingleton(settings);
 builder.Services.AddSingleton<OrderStore>();
-builder.Services.AddSingleton(new GpClient(new HttpClient { Timeout = TimeSpan.FromSeconds(15) }, settings));
+builder.Services.AddSingleton(new GpClient(GpClient.CreateHttpClient(), settings));
 builder.Services.AddCors();
 builder.Services.AddOptions<CorsOptions>().Configure<AppSettings>((options, config) =>
     options.AddPolicy("MerchantOrigins", policy => policy
