@@ -1,0 +1,85 @@
+@page "/demo/checkout/{OrderId}"
+@inject MerchantApiClient Api
+@inject NavigationManager Navigation
+
+<PageTitle>Demo checkout · Payment lab</PageTitle>
+<section class="intro">
+    <p class="eyebrow">LOCAL SIMULATOR / NOT THE GLOBAL PAYMENTS HPP</p>
+    <h1>Choose a test outcome.</h1>
+    <p>No payment is processed and no card information is collected.</p>
+</section>
+<section class="card result">
+    @if (error is not null)
+    {
+        <p class="notice error" role="alert">@error</p>
+    }
+    @if (order is { Mode: "demo" })
+    {
+        <h2>@Money.Format(order.Amount, order.Currency)</h2>
+        <p>Order @order.Id</p>
+        <p>Each action uses the API's demo endpoint and follows its real return or cancel callback.</p>
+        <div class="actions">
+            <button disabled="@(!interactive || busy)" @onclick='() => Complete("success")'>Simulate success</button>
+            <button disabled="@(!interactive || busy)" class="secondary" @onclick='() => Complete("declined")'>Simulate decline</button>
+            <button disabled="@(!interactive || busy)" class="secondary" @onclick='() => Complete("cancel")'>Cancel payment</button>
+        </div>
+    }
+    else if (error is null)
+    {
+        <p role="status">Loading demo order…</p>
+    }
+    <p><a href="/">Back to payment page</a></p>
+</section>
+
+@code {
+    [Parameter] public string OrderId { get; set; } = "";
+    [SupplyParameterFromQuery(Name = "key")] public string? OrderKey { get; set; }
+    private PaymentOrder? order;
+    private string? error;
+    private bool busy;
+    private bool interactive;
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (!firstRender) return;
+        interactive = true;
+        StateHasChanged();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        order = null;
+        error = null;
+        if (string.IsNullOrWhiteSpace(OrderKey))
+        {
+            error = "Use the complete demo checkout link returned by the API.";
+            return;
+        }
+        try
+        {
+            order = await Api.GetOrder(OrderId, OrderKey);
+            if (order.Mode != "demo") error = "The simulator is available only for demo orders.";
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            error = "The demo order could not be loaded. Check the link and API connection.";
+        }
+    }
+
+    private async Task Complete(string result)
+    {
+        if (busy || order?.Mode != "demo") return;
+        busy = true;
+        error = null;
+        try
+        {
+            var response = await Api.CompleteDemo(OrderId, OrderKey!, result);
+            Navigation.NavigateTo(response.RedirectUrl, forceLoad: true);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            error = "The demo outcome could not be recorded. Check the API connection and try again.";
+            busy = false;
+        }
+    }
+}

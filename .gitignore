@@ -10,5 +10,6 @@ obj/
 !.env.example
 data/
 wwwroot/
+!/client/Merchant.PaymentClient/wwwroot/
 *.sqlite*
 .DS_Store

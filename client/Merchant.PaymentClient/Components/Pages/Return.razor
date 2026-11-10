@@ -1,0 +1,12 @@
+@page "/payment/return"
+@page "/payment/success"
+@page "/payment/pending"
+@page "/payment/declined"
+
+<PageTitle>Payment return · Payment lab</PageTitle>
+<PaymentResult OrderId="@OrderId" OrderKey="@OrderKey" />
+
+@code {
+    [SupplyParameterFromQuery(Name = "order")] public string? OrderId { get; set; }
+    [SupplyParameterFromQuery(Name = "key")] public string? OrderKey { get; set; }
+}

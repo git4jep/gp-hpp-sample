@@ -1,0 +1,115 @@
+@page "/"
+@page "/payment"
+@inject MerchantApiClient Api
+@inject NavigationManager Navigation
+
+<PageTitle>Make a payment · Payment lab</PageTitle>
+<section class="intro">
+    <p class="eyebrow">GLOBAL PAYMENTS / HOSTED CHECKOUT</p>
+    <h1>Test a payment.</h1>
+    <p>A simple client for the merchant API. Choose an item, then continue to the hosted payment page.</p>
+</section>
+@if (error is not null)
+{
+    <p class="notice error" role="alert">@error</p>
+}
+@if (config is null)
+{
+    <p role="status">@(error is null ? "Connecting to the merchant API…" : "Start the API, then reload this page.")</p>
+}
+else
+{
+    <div class="checkout-grid">
+        <section class="card">
+            <div class="section-heading"><h2>Payment details</h2><span class="badge">@config.Mode.ToUpperInvariant()</span></div>
+            <EditForm Model="form" OnValidSubmit="Pay" FormName="payment">
+                <DataAnnotationsValidator />
+                <ValidationSummary />
+                <fieldset disabled="@(!interactive || busy)">
+                    <label for="email">Email address</label>
+                    <InputText id="email" type="email" autocomplete="email" @bind-Value="form.Email" />
+                    <label for="product">Product</label>
+                    <InputSelect id="product" @bind-Value="form.ProductId">
+                        @foreach (var product in config.Catalog)
+                        {
+                            <option value="@product.Id">@product.Name — @Money.Format(product.Price, config.Currency)</option>
+                        }
+                    </InputSelect>
+                    <label for="quantity">Quantity</label>
+                    <InputNumber id="quantity" min="1" max="10" @bind-Value="form.Quantity" />
+                    <button type="submit" disabled="@(!interactive || busy || Selected is null)">
+                        @(busy ? "Creating checkout…" : config.Mode == "demo" ? "Continue to demo checkout" : "Continue to secure payment")
+                    </button>
+                </fieldset>
+            </EditForm>
+        </section>
+        <aside class="card summary">
+            <p class="eyebrow">ORDER SUMMARY</p>
+            <h2>@(Selected?.Name ?? "Select a product")</h2>
+            <p>@form.Quantity item(s)</p>
+            <p class="total">@Money.Format((Selected?.Price ?? 0) * form.Quantity, config.Currency)</p>
+            <p>The API calculates the final amount using its own catalog prices.</p>
+            <hr />
+            <p>@(config.Mode == "demo"
+                ? "Demo mode simulates outcomes locally. No card or gateway account is required."
+                : "Sandbox mode opens the real GP-hosted page. Use sandbox test cards only.")</p>
+            <p>Return and cancel callbacks are processed by the API before you see the stored order status.</p>
+        </aside>
+    </div>
+}
+
+@code {
+    private MerchantConfig? config;
+    private readonly PaymentForm form = new();
+    private bool busy;
+    private bool interactive;
+    private string? error;
+    private Product? Selected => config?.Catalog.FirstOrDefault(product => product.Id == form.ProductId);
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (!firstRender) return;
+        interactive = true;
+        StateHasChanged();
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            config = await Api.GetConfig();
+            form.ProductId = config.Catalog.FirstOrDefault()?.Id ?? "";
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            error = "Cannot connect to the merchant API. Check that it is running and MerchantApi:BaseUrl is correct.";
+        }
+    }
+
+    private async Task Pay()
+    {
+        if (busy) return;
+        busy = true;
+        error = null;
+        try
+        {
+            var checkout = await Api.Checkout(form.Email, form.ProductId, form.Quantity);
+            Navigation.NavigateTo(checkout.HppUrl, forceLoad: true);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            error = "Checkout could not be created. Check the API connection and sandbox configuration, then try again.";
+            busy = false;
+        }
+    }
+
+    private sealed class PaymentForm
+    {
+        [Required, EmailAddress, StringLength(100)]
+        public string Email { get; set; } = "";
+        [Required]
+        public string ProductId { get; set; } = "";
+        [Range(1, 10)]
+        public int Quantity { get; set; } = 1;
+    }
+}

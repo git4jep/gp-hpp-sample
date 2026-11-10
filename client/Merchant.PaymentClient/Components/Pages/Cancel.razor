@@ -1,0 +1,10 @@
+@page "/payment/cancel"
+@page "/payment/cancelled"
+
+<PageTitle>Payment cancellation · Payment lab</PageTitle>
+<PaymentResult OrderId="@OrderId" OrderKey="@OrderKey" IsCancellation="true" />
+
+@code {
+    [SupplyParameterFromQuery(Name = "order")] public string? OrderId { get; set; }
+    [SupplyParameterFromQuery(Name = "key")] public string? OrderKey { get; set; }
+}

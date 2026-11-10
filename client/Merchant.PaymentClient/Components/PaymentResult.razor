@@ -1,0 +1,94 @@
+@inject MerchantApiClient Api
+
+<section class="intro">
+    <p class="eyebrow">@(IsCancellation ? "CANCELLATION CALLBACK" : "PAYMENT RETURN")</p>
+    <h1>@Heading</h1>
+    <p>@Description</p>
+</section>
+<section class="card result" aria-live="polite">
+    @if (error is not null)
+    {
+        <p class="notice error" role="alert">@error</p>
+    }
+    @if (order is not null)
+    {
+        <div class="section-heading"><h2>Order details</h2><span class="badge">@order.Status</span></div>
+        <dl>
+            <dt>Order</dt><dd>@order.Id</dd>
+            <dt>Amount</dt><dd>@Money.Format(order.Amount, order.Currency)</dd>
+            <dt>Environment</dt><dd>@order.Mode</dd>
+            <dt>Transaction</dt><dd>@(order.TransactionId ?? "Not yet available")</dd>
+            <dt>Gateway status</dt><dd>@(order.GpStatus ?? "Not yet available")</dd>
+        </dl>
+        @foreach (var item in order.Items)
+        {
+            <p>@item.Quantity × @item.Name <strong>@Money.Format(item.Price * item.Quantity, order.Currency)</strong></p>
+        }
+    }
+    else if (busy)
+    {
+        <p role="status">Reading the stored order from the API…</p>
+    }
+    <div class="actions">
+        <button disabled="@(!interactive || busy || !HasOrder)" @onclick="() => Load(false)">Refresh status</button>
+        <button class="secondary" disabled="@(!interactive || busy || !HasOrder)" @onclick="() => Load(true)">Verify with API</button>
+        <a href="/">New payment</a>
+    </div>
+    <p class="small">Only the API's stored status determines the result. Cancellation does not reverse a completed payment; a later verified approval can still appear here.</p>
+</section>
+
+@code {
+    [Parameter] public string? OrderId { get; set; }
+    [Parameter] public string? OrderKey { get; set; }
+    [Parameter] public bool IsCancellation { get; set; }
+    private PaymentOrder? order;
+    private bool busy;
+    private bool interactive;
+    private string? error;
+    private bool HasOrder => !string.IsNullOrWhiteSpace(OrderId) && !string.IsNullOrWhiteSpace(OrderKey);
+    private string Heading => order?.Status switch
+    {
+        "PAID" => "Payment completed.",
+        "AUTHORIZED" => "Payment authorized.",
+        "DECLINED" => "Payment declined.",
+        "CANCELLED" => "Payment cancelled.",
+        _ => "Payment status pending."
+    };
+    private string Description => order?.Status switch
+    {
+        "PAID" => "The API confirms this payment was captured.",
+        "AUTHORIZED" => "The payment is authorized, but has not been captured.",
+        "DECLINED" => "The payment was declined. You can start a new checkout.",
+        "CANCELLED" => "Checkout was cancelled. No successful payment is currently recorded.",
+        _ => "A return callback is not proof of payment. Refresh or verify with the API to check the latest result."
+    };
+
+    protected override Task OnParametersSetAsync() => Load(false);
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (!firstRender) return;
+        interactive = true;
+        StateHasChanged();
+    }
+
+    private async Task Load(bool reconcile)
+    {
+        if (busy) return;
+        error = null;
+        if (!HasOrder)
+        {
+            order = null;
+            error = "This page needs the complete order link supplied by the payment callback.";
+            return;
+        }
+        busy = true;
+        try { order = await Api.GetOrder(OrderId!, OrderKey!, reconcile); }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            order = null;
+            error = "The order status could not be retrieved or verified. Check your order link and API connection, then retry.";
+        }
+        finally { busy = false; }
+    }
+}

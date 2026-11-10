@@ -1,6 +1,8 @@
 # Setup and deployment runbook
 
-This guide deploys the existing Angular storefront and ASP.NET Core API as **one web application**. It supports a local simulator or the Global Payments **sandbox**, not production payment processing.
+This guide covers the Angular storefront/API deployment and the separate **Blazor payment test client**. Both support a local simulator or the Global Payments **sandbox**, not production payment processing.
+
+Sections 2–10 describe the Angular/API deployment and shared operational requirements. For the standalone Blazor deployment, follow [section 11](#11-deploy-the-blazor-payment-test-client); Angular and Node.js are not required for that application.
 
 All build commands below run from the repository root unless stated otherwise. Examples use a Unix shell; substitute your own hostname and writable storage paths.
 
@@ -9,6 +11,7 @@ All build commands below run from the repository root unless stated otherwise. E
 - **Local development:** Angular serves on port 4200 and proxies API/callback requests to C# on port 5080.
 - **Single-origin local demo:** build Angular, then let C# serve the storefront, APIs, and callbacks together.
 - **Public sandbox deployment:** publish the built Angular assets inside the C# release artifact. Expose one HTTPS origin through a reverse proxy or managed application host.
+- **Standalone Blazor client:** publish the API and Blazor client separately. Keep the API private and expose the Blazor host over HTTPS; it forwards provider callbacks to the API.
 
 Do not deploy the Angular development server as the public release server. Do not deploy only Angular assets to a static host: HPP callbacks need the C# backend, and the current frontend uses same-origin `/api` URLs.
 
@@ -192,7 +195,7 @@ There is no dedicated health/readiness endpoint. A successful `/api/config` is o
 10. Confirm a verified notification can update an order even without a browser return. Use authenticated event/reconciliation APIs for recovery as needed.
 11. Restart the service and confirm the same order can still be retrieved from durable storage.
 
-Automated verification after endpoint extraction passed 25 backend tests and 4 Chrome demo-flow tests. The last attempted real sandbox checkout from localhost returned upstream **502** before reaching HPP. Consequently, actual provider payment/cancellation redirects remain an **outstanding acceptance check**, not a completed deployment guarantee.
+Automated verification passed 39 .NET tests (25 backend and 14 Blazor/API integration cases). The Blazor Chrome smoke test also passed automatic success, decline, and cancellation navigation, status actions, and mobile layout checks. These are demo/fake-provider checks, not actual GP transactions. The last attempted real sandbox checkout from localhost returned upstream **502** before reaching HPP. Actual provider payment/cancellation redirects remain an **outstanding acceptance check**, not a completed deployment guarantee.
 
 ## 9. Troubleshooting
 
@@ -235,3 +238,189 @@ Set an independent `ADMIN_API_KEY` of at least 32 characters and send it only as
 Build releases into separate directories, preserve persistent storage and secrets, and switch the supervised process to the new artifact only after smoke checks. Retain the previous release for rollback. Restart into the prior artifact if necessary, but do not overwrite the live database with a stale copy. If a future release changes the schema, verify rollback compatibility before deploying it.
 
 Review the [production-work limitations](../README.md#scope-and-production-work) before expanding the sample: checkout idempotency, reliable background reconciliation, refund/reversal states, durable queues, monitoring, migrations, and real GP production onboarding are not implemented here.
+
+## 11. Deploy the Blazor payment test client
+
+### Architecture and prerequisites
+
+The Blazor application is an interactive server-side .NET 10 application, not a static WebAssembly site. It requires a continuously running ASP.NET Core process and a browser connection to its Blazor circuit.
+
+Request flow:
+
+1. Browser → public HTTPS Blazor host.
+2. Blazor → private API for catalog, checkout, orders, and reconciliation.
+3. Browser → GP-hosted payment page.
+4. GP browser return/cancel or server notification → public Blazor callback route → private API.
+5. API verifies/persists the result and returns breakout HTML → browser navigates to a Blazor result page.
+
+Use the .NET 10 SDK to build and ASP.NET Core Runtime 10 to run both applications. Node.js is needed only for the optional Playwright smoke test, not for building or serving Blazor. Apply the shared SQLite storage and sandbox credential requirements in sections 2, 4, and 5.
+
+### Build, test, and publish
+
+From the repository root:
+
+```sh
+dotnet restore Merchant.sln
+dotnet test Merchant.sln --no-restore
+dotnet publish backend/Merchant.Api/Merchant.Api.csproj \
+  --configuration Release --self-contained false --output dist/api
+dotnet publish client/Merchant.PaymentClient/Merchant.PaymentClient.csproj \
+  --configuration Release --self-contained false --output dist/payment-client
+```
+
+Deploy both **entire** output directories, including runtime dependencies, static web assets, configuration files, and SQLite native assets. For example, place them at `/srv/northstar/releases/current/api` and `/srv/northstar/releases/current/payment-client`. Do not build Angular for this deployment; the API does not need its storefront assets.
+
+When publishing from a checkout where Angular has previously been built, the API may still contain Angular files in `wwwroot`. Those assets are not used by Blazor. Keep the API listener private rather than exposing its old storefront as another public entry point.
+
+Add and test an appropriate `--runtime` identifier if targeting a different OS/CPU. Do not copy `.env`, local databases, or developer-specific launch configuration into service environment files.
+
+### Configure the two services separately
+
+Set these non-secret environment variables on the **API service**:
+
+```text
+GP_MODE=sandbox
+PUBLIC_BASE_URL=https://payments.example.com
+LOCAL_DEV_ORIGINS=
+GP_ACCOUNT_NAME=transaction_processing
+GP_CURRENCY=USD
+GP_COUNTRY=US
+DATABASE_PATH=/srv/northstar/data/merchant.sqlite
+ASPNETCORE_ENVIRONMENT=Production
+ASPNETCORE_URLS=http://127.0.0.1:5080
+```
+
+Replace the origin, processing account, currency/country, and database path with your deployment values. Supply `GP_APP_KEY` and the separate `ADMIN_API_KEY` privately to the API service using the host's secret manager. Set the merchant/App IDs if not using the sample defaults. Do not put any of these secrets in the Blazor service.
+
+Set these variables on the **Blazor service**:
+
+```text
+MerchantApi__BaseUrl=http://127.0.0.1:5080/
+ASPNETCORE_ENVIRONMENT=Production
+ASPNETCORE_URLS=http://127.0.0.1:5090
+AllowedHosts=payments.example.com
+```
+
+`MerchantApi__BaseUrl` uses the double-underscore convention for `MerchantApi:BaseUrl`. It must be an HTTP(S) origin without credentials, path prefixes, query strings, or fragments. It points to the API listener, **not** the public Blazor host; pointing it at Blazor creates failed requests or callback loops.
+
+`PUBLIC_BASE_URL` belongs to the API and must point to the **public Blazor HTTPS origin**. It controls the HPP link's callback URLs and the final result-page destination. The client makes normal API requests server-to-server, so adding its origin to `LOCAL_DEV_ORIGINS` is unnecessary.
+
+The loopback bindings assume all processes run on one host. With separate containers/services, use private service DNS, the required container bindings/ports, and appropriate network policy. Keep port 5080 inaccessible from the public internet. Use authenticated/encrypted private transport when the API is not on a trusted local network.
+
+### Start the published services
+
+After injecting the respective environments and preparing durable SQLite storage, run each command as a separate supervised service:
+
+```sh
+dotnet /srv/northstar/releases/current/api/Merchant.Api.dll \
+  --contentRoot /srv/northstar/releases/current/api
+```
+
+```sh
+dotnet /srv/northstar/releases/current/payment-client/Merchant.PaymentClient.dll \
+  --contentRoot /srv/northstar/releases/current/payment-client
+```
+
+Run under non-root service identities and configure automatic restart. The API identity needs database-directory write access; Blazor does not need database access. Start the API first. Neither published application automatically loads the repository's `.env`, and `launchSettings.json` does not configure a published process.
+
+Keep one API and one Blazor instance for this sample. Interactive circuits live in Blazor server memory; deployments/restarts interrupt them. A scaled deployment needs a deliberate circuit/session-affinity and shared Data Protection key strategy in addition to addressing the API's SQLite limits.
+
+### HTTPS ingress and WebSocket routing
+
+Route the public hostname's **entire path space** to the Blazor listener on port 5090, preserving methods, paths, query strings, callback content types, and bodies. Do not route ordinary `/api/**` traffic directly to the API: this client intentionally exposes only the three provider callback patterns, not public API/admin proxying.
+
+Ingress must support:
+
+- `/`, `/payment`, and static assets, including `/_framework/**`.
+- `/_blazor` negotiation and WebSocket upgrades/long-lived connections.
+- `GET|POST /payments/return/{id}` and `/payments/cancel/{id}`.
+- `POST /api/payments/notifications/{id}`.
+- `/payment/**` result pages and `/demo/checkout/**` when using demo mode.
+
+Example Nginx configuration inside its `http` context (adapt certificate paths and timeouts to your host):
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+# Do not record callback state or receipt access keys in access logs.
+log_format payment_safe '$remote_addr $request_method $uri $status';
+
+server {
+    listen 443 ssl;
+    server_name payments.example.com;
+    ssl_certificate /etc/letsencrypt/live/payments.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/payments.example.com/privkey.pem;
+    access_log /var/log/nginx/payment-access.log payment_safe;
+    client_max_body_size 32k;
+
+    location / {
+        proxy_pass http://127.0.0.1:5090;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+}
+```
+
+Point DNS at this ingress and install the actual certificate before use. If offering HTTP, redirect browser GET traffic to HTTPS, but configure GP callback URLs as HTTPS from the outset rather than depending on a redirect for provider POST requests.
+
+Do not overwrite callback responses' Content Security Policy or add a blanket `X-Frame-Options: DENY`: GP may render the API's HTML bridge in a frame before it navigates the top-level browser. Do not cache callbacks or result pages. Disable/redact query strings in all ingress, tunnel, tracing, and application request logs; callback and receipt URLs contain private capabilities.
+
+Notifications must bypass interactive authentication and browser-only gateway challenges. Callback state validation remains in the API; preserving the `state` query is mandatory. Keep the API's rate limits in mind: forwarded requests share the Blazor server's API-facing IP and therefore share its rate-limit buckets.
+
+### Validate the deployed release
+
+From the host, confirm the private API configuration:
+
+```sh
+curl --fail --silent --show-error http://127.0.0.1:5080/api/config
+```
+
+From outside the network, check the Blazor routes:
+
+```sh
+curl --fail --silent --show-error --output /dev/null https://payments.example.com/
+curl --fail --silent --show-error --output /dev/null \
+  https://payments.example.com/payment/return
+curl --fail --silent --show-error --output /dev/null \
+  https://payments.example.com/payment/cancel
+```
+
+The two result routes without an order link should render a message requesting the complete link, never a successful-payment receipt. `/api/config` is intentionally **not** exposed on the public Blazor host; use the private API listener for that check.
+
+In a browser, verify that the payment form becomes enabled after its Blazor connection is established. Create a new sandbox checkout and exercise actual GP completion and cancellation. Confirm the HPP link uses:
+
+- `https://payments.example.com/payments/return/{orderId}?state=...`
+- `https://payments.example.com/payments/cancel/{orderId}?state=...`
+- `https://payments.example.com/api/payments/notifications/{orderId}?state=...`
+
+Do not configure `/payment/return` or `/payment/cancel` as provider callback URLs: these are display-only result-page aliases. The API's real callbacks validate state, reconcile payment status, then navigate to `/payment/success`, `/payment/pending`, `/payment/declined`, or `/payment/cancelled`, carrying the separate order access key.
+
+Check **Refresh status** and **Verify with API**, and confirm a recorded authorization is not presented as captured funds. Restart both services and verify that a complete stored order link still loads. Follow the full sandbox acceptance steps in section 8; demo checks do not certify real GP behavior.
+
+For a credential-free deployment check, set `GP_MODE=demo` on the API while retaining the public Blazor origin, restart the API, and create new demo orders. To run automated local browser checks with temporary servers/storage:
+
+```sh
+dotnet build Merchant.sln
+npm ci --prefix frontend
+node client/Merchant.PaymentClient.Tests/browser-smoke.cjs
+```
+
+The script uses ports 15080/15090 and installed Chrome. For Playwright Chromium, install it from the frontend directory and set `PLAYWRIGHT_CHANNEL=chromium`. Node/Playwright are verification tools only, not Blazor runtime dependencies.
+
+### Blazor-specific troubleshooting and rollback
+
+- **Form remains disabled or buttons do not respond:** check that `/_blazor` negotiation/WebSockets reach the Blazor process and that ingress permits long-lived connections. Reload after a service restart.
+- **“Cannot connect to the merchant API”:** verify the Blazor service's `MerchantApi__BaseUrl`, API availability, private network/firewall rules, and private `/api/config` response.
+- **Callback returns 502:** the Blazor callback forwarder cannot reach the API, or the upstream API returned an error. Check both services without logging state keys or raw callback payloads.
+- **Callback returns 404:** check the complete state query, order/mode, API database, and whether an older HPP link points at an obsolete deployment origin.
+- **Browser returns to Angular, localhost, or the wrong hostname:** set the API's `PUBLIC_BASE_URL` to the public Blazor origin, restart it, and create a new HPP link.
+- **Published app is missing assets:** deploy the full publish directory and use the correct absolute `--contentRoot`; do not copy only the DLL.
+
+Version and roll out the API and client as a compatible pair. Retain the previous pair for rollback, preserve the database and secrets, and expect active Blazor circuits to reconnect/reload during a release. Never roll back by replacing the live database with a stale release copy.

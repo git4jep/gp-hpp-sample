@@ -2,6 +2,8 @@
 
 A fictitious merchant storefront built with **Angular 22**, an **ASP.NET Core / C# .NET 10 API**, and **SQLite**.
 
+An independent **Blazor / C# payment test client** is also available in `client/Merchant.PaymentClient`. It uses the same API and supports the complete HPP return/cancel flow without building or running Angular. See [Blazor payment test client](#blazor-payment-test-client).
+
 The important behavior is a full-page round trip: merchant → Global Payments Hosted Payment Page → merchant return or cancellation callback → Angular merchant result page. Card details are entered only on the actual GP-hosted page, never on this application.
 
 ## Documentation
@@ -10,6 +12,7 @@ The important behavior is a full-page round trip: merchant → Global Payments H
 - [Sandbox setup](#actual-global-payments-sandbox): use the actual GP API and public HTTPS callbacks.
 - [Configuration reference](#configuration-reference): environment variables and secret handling.
 - [Deployment guide](docs/DEPLOYMENT.md): release builds, runtime configuration, HTTPS, SQLite storage, verification, and troubleshooting.
+- [Blazor deployment](docs/DEPLOYMENT.md#11-deploy-the-blazor-payment-test-client): separate API/client services, callback forwarding, and WebSocket ingress.
 
 ## Requirements
 
@@ -31,6 +34,8 @@ python3 --version
 ### Project structure
 
 - `frontend/`: Angular application, development proxy, and Playwright browser tests.
+- `client/Merchant.PaymentClient/`: standalone .NET 10 Blazor payment test client, result pages, demo checkout, and HPP callback forwarding.
+- `client/Merchant.PaymentClient.Tests/`: Blazor/API HTTP integration tests.
 - `backend/Merchant.Api/Program.cs`: dependency injection, middleware, and endpoint registration.
 - `backend/Merchant.Api/Endpoints/`: configuration, checkout, orders, admin, demo, and HPP callback classes. Edit `PaymentCallbackEndpoints.cs` for return/cancel handling.
 - `backend/Merchant.Api/GpClient.cs`: GP authentication, HPP link creation, and transaction verification.
@@ -39,6 +44,67 @@ python3 --version
 - `backend/Merchant.Api.Tests/`: fake-provider and HTTP integration tests.
 - `scripts/`: hidden-input credential setup and local API launch helpers.
 - `.env.example`: non-secret configuration reference; do not put real keys in this file.
+
+## Blazor payment test client
+
+Only the .NET 10 SDK is required for this client; Node.js and Angular are not needed. Run the API and Blazor host in **separate terminals**, from the repository root.
+
+Start the API in demo mode with callbacks pointing at Blazor:
+
+```sh
+GP_MODE=demo PUBLIC_BASE_URL=http://localhost:5090 python3 scripts/run-api.py
+```
+
+Start the new client:
+
+```sh
+dotnet run --project client/Merchant.PaymentClient
+```
+
+Open **http://localhost:5090**. Enter a test email, select a product and quantity, and continue to demo checkout. Choose **Simulate success**, **Simulate decline**, or **Cancel payment**. Each action travels through the actual API callback handlers and returns to a Blazor result page.
+
+The client calls the API server-to-server at `http://127.0.0.1:5080/`. Override this using `MerchantApi__BaseUrl` or the `MerchantApi:BaseUrl` setting in `client/Merchant.PaymentClient/appsettings.json`. Keep this configured as the **API's internal origin**, not the Blazor origin, to avoid a forwarding loop. No GP credentials or administrator keys are needed in the client.
+
+### Blazor with the real GP sandbox
+
+1. Start the client as above and expose **the Blazor host**, not the API, through a public HTTPS tunnel:
+
+   ```sh
+   ngrok http 5090
+   ```
+
+2. Configure your existing private API `.env` with `GP_MODE=sandbox`, `PUBLIC_BASE_URL` set to that tunnel's HTTPS origin, and your GP credentials/account as described in [sandbox setup](#actual-global-payments-sandbox). Do not put secrets in the Blazor project. If `.env` does not exist, `python3 scripts/setup.py` can create it privately.
+3. Restart the API using `python3 scripts/run-api.py`. Ensure no exported `GP_MODE` or `PUBLIC_BASE_URL` overrides the intended `.env` values.
+4. Open the tunnel URL, create a **new** checkout, and complete or cancel payment on the GP-hosted page. The API supplies the public callback URLs when creating the HPP link.
+
+The Blazor host forwards only these provider callback routes to the configured API, preserving GET/POST payloads, query strings, status codes, and the API's iframe-breakout HTML/CSP:
+
+- `GET|POST /payments/return/{id}?state=...`
+- `GET|POST /payments/cancel/{id}?state=...`
+- `POST /api/payments/notifications/{id}?state=...`
+
+The API still validates callback state and reconciles sandbox payments against GP. It then navigates to Blazor's `/payment/success`, `/payment/pending`, `/payment/declined`, or `/payment/cancelled` page. `/payment/return` and `/payment/cancel` are also result-page aliases; they need the API-supplied `order` and `key` query parameters. **Do not use these result pages as the provider callback URLs**: provider callbacks must pass through `/payments/...` first.
+
+Result pages read the stored order from the API; changing the route cannot fabricate success. **Refresh status** reads current state; **Verify with API** requests reconciliation. An authorization is displayed separately from capture. Keep receipt URLs private.
+
+For deployment, publish the API and Blazor project separately, configure the client's internal API origin, and route public HTTPS traffic (including Blazor WebSockets) to the Blazor host. Keep `PUBLIC_BASE_URL` set to that public Blazor origin. No Angular build is required:
+
+```sh
+dotnet publish backend/Merchant.Api -c Release -o dist/api
+dotnet publish client/Merchant.PaymentClient -c Release -o dist/payment-client
+```
+
+Run all API and Blazor HTTP integration tests with `dotnet test Merchant.sln`. Actual GP account permissions, 3DS, and real HPP behavior still require a sandbox run.
+
+Optional real-browser verification reuses the existing frontend Playwright installation:
+
+```sh
+dotnet build Merchant.sln
+npm ci --prefix frontend
+node client/Merchant.PaymentClient.Tests/browser-smoke.cjs
+```
+
+The smoke test starts and stops its own demo API/client on ports 15080/15090 with a temporary database. It checks interactive checkout, automatic success/decline/cancel callback navigation, status buttons, and mobile layout. It uses installed Chrome by default; set `PLAYWRIGHT_CHANNEL=chromium` after installing Playwright Chromium if needed.
 
 ## Start immediately: local demonstration
 
