@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.angular/
+test-results/
+playwright-report/
+bin/
+obj/
+.env
+.env.*
+!.env.example
+data/
+wwwroot/
+*.sqlite*
+.DS_Store
