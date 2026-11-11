@@ -11,6 +11,7 @@ The important behavior is a full-page round trip: merchant → Global Payments H
 - [Local setup](#start-immediately-local-demonstration): run immediately without credentials.
 - [Sandbox setup](#actual-global-payments-sandbox): use the actual GP API and public HTTPS callbacks.
 - [Configuration reference](#configuration-reference): environment variables and secret handling.
+- [Cancellation workflow](#cancellation-workflow-api-to-merchant-website): HPP cancel callback, order updates, and navigation back to the merchant cancel page.
 - [Deployment guide](docs/DEPLOYMENT.md): release builds, runtime configuration, HTTPS, SQLite storage, verification, and troubleshooting.
 - [Blazor deployment](docs/DEPLOYMENT.md#11-deploy-the-blazor-payment-test-client): separate API/client services, callback forwarding, and WebSocket ingress.
 
@@ -237,6 +238,31 @@ After processing, the browser lands on:
 The Angular page **always retrieves the stored order**. Editing `/payment/pending` to `/payment/success` cannot fabricate a successful payment. `PREAUTHORIZED` is shown as **authorized**, not captured/paid.
 
 Cancelling checkout records abandonment. It does **not** reverse a payment, invalidate an HPP link, or guarantee that an in-flight transaction cannot complete. A later verified approval takes precedence, and the merchant page updates accordingly.
+
+### Cancellation workflow: API to merchant website
+
+There are two different URLs in this flow:
+
+- **Provider callback:** `/payments/cancel/{orderId}?state={randomCallbackKey}` is an API endpoint, not a UI page.
+- **Merchant cancel page:** `/payment/cancelled?order={orderId}&key={orderAccessKey}` is the customer-facing Angular or Blazor page.
+
+The normal round trip is: **merchant checkout → GP HPP → API cancel callback → merchant cancel page**.
+
+1. **Register the callback when creating checkout.** `POST /api/checkout` creates the order with separate random callback and order-access keys. `PaymentRules.Urls` builds the callback from `PUBLIC_BASE_URL`; `GpClient.CreateLink` sends it to GP as `notifications.cancel_url` in `POST /ucp/links`. The checkout response also includes it as `callbacks.cancel_url`.
+2. **Receive the shopper's cancellation.** When GP invokes the registered cancel URL, `PaymentCallbackEndpoints.HandleCancel` accepts GET or POST and calls the shared callback pipeline with `kind = "cancel"`. No transaction ID is required. The supported payload formats and optional transaction ID hints are described above.
+3. **Validate and record cancellation.** The API checks that the order exists, matches the current demo/sandbox mode, and has the correct query-string `state`. A missing or incorrect state returns **404** without recording cancellation or generating redirect HTML. After payload validation, it records a sanitized `cancel` event and sets `CancelledAt`. The order becomes `CANCELLED` unless it is already `PAID` or `AUTHORIZED`.
+4. **Check for a payment that completed anyway.** In sandbox mode the API reconciles against GP, using the transaction ID hint if supplied, otherwise searching by order reference. Callback claims alone cannot establish approval. If GP verification raises an `ApiException`, the API records `verification-pending` and still continues the browser flow. Demo mode skips GP reconciliation.
+5. **Choose the merchant destination from the stored order.** If the order is now `PAID` or `AUTHORIZED`, the cancel callback targets `/payment/success`. Otherwise it targets `/payment/cancelled`, even if reconciliation found a decline or could not complete. Both URLs include `order` and the separate order-access `key`; the callback `state` is not reused as the receipt key.
+6. **Navigate out of HPP.** The callback returns **HTTP 200 `text/html`**, not an HTTP 302/303 or a JSON redirect response. Its nonce-protected script calls `window.top.location.replace(destination)` to leave the HPP frame, falling back to `window.location.replace(destination)` if top-window navigation throws. A **Continue to your order** link with `target="_top"` provides manual navigation when automatic navigation is blocked. The response's CSP allows framing by GP's `*.globalpay.com` and `*.realexpayments.com` hosts.
+7. **Load the actual result on the merchant website.** The result page reads the stored order using its access key. Angular also requests reconciliation on initial load and can replace the route with success, declined, or pending if the latest stored result differs. Blazor reads the order initially and offers **Refresh status** and **Verify with API**. Visiting a cancel-page URL does not itself cancel an order or override its payment status.
+
+**Redirect origin and hosting.** The API constructs the destination as `{PUBLIC_BASE_URL}/payment/{page}`; it does not use the incoming referrer or accept a per-request merchant redirect URL. There is no separate configurable cancel-page path. Set `PUBLIC_BASE_URL` to the public merchant website origin, with no path, and make sure that origin serves both the callback routes and result pages. For Blazor, the public host forwards `/payments/cancel/{id}` to the internal API configured by `MerchantApi__BaseUrl`, then relays the API's HTML and CSP unchanged. If that API is unreachable, the proxy returns **502** instead of a merchant redirect.
+
+Restart the API after changing `PUBLIC_BASE_URL` and create a new checkout: existing GP links retain the callback URLs supplied when they were created. If checkout began on localhost while callbacks use a public tunnel, the shopper returns to the public origin, not localhost.
+
+**Demo verification.** Choose **Cancel payment** on the demo checkout. The simulator calls `POST /api/demo/orders/{id}/complete?key={orderAccessKey}` with `{"result":"cancel"}` and receives a JSON `redirectUrl` pointing at the API cancel callback. The browser follows that URL, exercising the same cancellation recording and HTML navigation as the sandbox callback. For a fresh unpaid order, confirm the browser reaches `/payment/cancelled` and the stored order reports `CANCELLED`. This verifies the local application flow, not GP's real HPP cancel action.
+
+Implementation references: `backend/Merchant.Api/Endpoints/PaymentCallbackEndpoints.cs`, `backend/Merchant.Api/Endpoints/EndpointGuards.cs`, `backend/Merchant.Api/OrderStore.cs`, and `client/Merchant.PaymentClient/PaymentCallbackProxy.cs`. Automated coverage includes `HttpDemoReturnsToDifferentMerchantPagesAndChecksCapabilities`, `LateCancellationOrDeclineCannotOverwriteVerifiedPayment`, and `ApprovalAfterCancellationIsStillRecordedAndDuplicatesAreIdempotent` in `backend/Merchant.Api.Tests/PaymentTests.cs`.
 
 ## Backend API
 
