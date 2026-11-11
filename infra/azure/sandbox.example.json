@@ -1,0 +1,12 @@
+{
+  "subscription": "b8defd0f-eced-4c81-8eb5-7f95fc21fe02",
+  "resourceGroup": "rg-merchant-sandbox",
+  "location": "westus",
+  "prefix": "efile",
+  "operatorIp": "YOUR-PUBLIC-IPV4",
+  "planSku": "B1",
+  "gpAccountName": "transaction_processing",
+  "currency": "USD",
+  "country": "US",
+  "paymentMode": "sandbox"
+}

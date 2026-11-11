@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
@@ -13,6 +14,11 @@ public record PaymentLink(string Id, string Url);
 
 public sealed class GpClient(HttpClient http, AppSettings settings)
 {
+    public static HttpClient CreateHttpClient() => new(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+    }) { Timeout = TimeSpan.FromSeconds(15) };
+
     private AccessToken? cached;
     private readonly SemaphoreSlim tokenLock = new(1, 1);
     public static string Secret(string nonce, string appKey) =>
@@ -57,13 +63,7 @@ public sealed class GpClient(HttpClient http, AppSettings settings)
                 secret = Secret(nonce, settings.AppKey),
                 grant_type = "client_credentials"
             });
-            // var data = await Request("accesstoken", HttpMethod.Post, new JsonObject
-            // {
-            //     ["app_id"] = settings.AppId,
-            //     ["nonce"] = nonce,
-            //     ["secret"] = Secret(nonce, settings.AppKey),
-            //     ["grant_type"] = "client_credentials"
-            // });
+
             if (Text(data, "token") == "" || !data.TryGetProperty("scope", out var scope) ||
                 Text(scope, "merchant_id") != settings.MerchantId)
                 throw new ApiException(502, "Access token scope does not match the configured merchant.");

@@ -1,4 +1,7 @@
 using Microsoft.Data.Sqlite;
+using Microsoft.Data.SqlClient;
+using System.Data;
+using System.Data.Common;
 using System.Text.Json;
 
 namespace Merchant.Api;
@@ -6,14 +9,23 @@ namespace Merchant.Api;
 public sealed class OrderStore
 {
     private readonly string connectionString;
+    private readonly bool sqlServer;
     public OrderStore(AppSettings settings)
     {
+        settings.ValidateDatabase();
+        sqlServer = settings.DatabaseProvider == "sqlserver";
+        if (sqlServer)
+        {
+            connectionString = settings.DatabaseConnectionString;
+            using var sql = (SqlConnection)Open();
+            DatabaseSchema.Check(sql);
+            return;
+        }
         var path = Path.GetFullPath(settings.DatabasePath);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
         using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = """
+        using var cmd = Command(db, """
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS orders (
                 id TEXT PRIMARY KEY, mode TEXT NOT NULL, access_key TEXT NOT NULL, callback_key TEXT NOT NULL,
@@ -25,14 +37,66 @@ public sealed class OrderStore
                 id INTEGER PRIMARY KEY, order_id TEXT NOT NULL, source TEXT NOT NULL,
                 payload TEXT NOT NULL, verified INTEGER NOT NULL, created_at TEXT NOT NULL
             );
-            """;
+            """);
         cmd.ExecuteNonQuery();
     }
-    private SqliteConnection Open()
+    private DbConnection Open()
     {
-        var db = new SqliteConnection(connectionString);
-        db.Open();
-        return db;
+        DbConnection db = sqlServer ? new SqlConnection(connectionString) : new SqliteConnection(connectionString);
+        try
+        {
+            db.Open();
+            return db;
+        }
+        catch
+        {
+            db.Dispose();
+            throw;
+        }
+    }
+
+    private DbCommand Command(DbConnection db, string text)
+    {
+        var command = db.CreateCommand();
+        command.CommandText = sqlServer
+            ? text.Replace("payment_events", "dbo.payment_events", StringComparison.Ordinal)
+                .Replace("orders", "dbo.orders", StringComparison.Ordinal)
+            : text;
+        return command;
+    }
+
+    public void CheckReadiness()
+    {
+        using var connection = Open();
+        if (connection is SqlConnection sql) DatabaseSchema.Check(sql);
+        using var command = Command(connection, "SELECT id FROM orders WHERE 1=0");
+        using var reader = command.ExecuteReader();
+    }
+
+    private static void Add(DbCommand command, string name, object? value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value ?? DBNull.Value;
+        parameter.DbType = value is int ? DbType.Int32 : DbType.String;
+        if (parameter is SqlParameter sql && value is not int)
+        {
+            // Match the schema rather than inferring parameter types/lengths from each value.
+            (sql.SqlDbType, sql.Size) = name switch
+            {
+                "@id" => (SqlDbType.VarChar, 50),
+                "@mode" => (SqlDbType.VarChar, 10),
+                "@access" or "@callback" => (SqlDbType.VarChar, 48),
+                "@status" => (SqlDbType.VarChar, 20),
+                "@currency" => (SqlDbType.VarChar, 3),
+                "@now" => (SqlDbType.VarChar, 40),
+                "@source" => (SqlDbType.VarChar, 80),
+                "@link" or "@transaction" => (SqlDbType.NVarChar, 256),
+                "@gp" => (SqlDbType.NVarChar, 200),
+                _ => (SqlDbType.NVarChar, -1)
+            };
+        }
+        command.Parameters.Add(parameter);
     }
     public Order Create(CartItem[] items, AppSettings settings)
     {
@@ -55,28 +119,26 @@ public sealed class OrderStore
             CreatedAt = DateTimeOffset.UtcNow.ToString("O")
         };
         using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = """
+        using var cmd = Command(db, """
             INSERT INTO orders (id, mode, access_key, callback_key, status, amount, currency, items, created_at, updated_at)
-            VALUES ($id, $mode, $access, $callback, 'PENDING', $amount, $currency, $items, $now, $now)
-            """;
-        cmd.Parameters.AddWithValue("$id", order.Id);
-        cmd.Parameters.AddWithValue("$mode", order.Mode);
-        cmd.Parameters.AddWithValue("$access", order.AccessKey);
-        cmd.Parameters.AddWithValue("$callback", order.CallbackKey);
-        cmd.Parameters.AddWithValue("$amount", order.Amount);
-        cmd.Parameters.AddWithValue("$currency", order.Currency);
-        cmd.Parameters.AddWithValue("$items", JsonSerializer.Serialize(order.Items));
-        cmd.Parameters.AddWithValue("$now", order.CreatedAt);
+            VALUES (@id, @mode, @access, @callback, 'PENDING', @amount, @currency, @items, @now, @now)
+            """);
+        Add(cmd, "@id", order.Id);
+        Add(cmd, "@mode", order.Mode);
+        Add(cmd, "@access", order.AccessKey);
+        Add(cmd, "@callback", order.CallbackKey);
+        Add(cmd, "@amount", order.Amount);
+        Add(cmd, "@currency", order.Currency);
+        Add(cmd, "@items", JsonSerializer.Serialize(order.Items));
+        Add(cmd, "@now", order.CreatedAt);
         cmd.ExecuteNonQuery();
         return order;
     }
     public Order? Get(string id)
     {
         using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = "SELECT * FROM orders WHERE id = $id";
-        cmd.Parameters.AddWithValue("$id", id);
+        using var cmd = Command(db, "SELECT * FROM orders WHERE id = @id");
+        Add(cmd, "@id", id);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
         string Text(string key) => r.GetString(r.GetOrdinal(key));
@@ -102,44 +164,42 @@ public sealed class OrderStore
     private void Execute(string sql, params (string Key, object? Value)[] parameters)
     {
         using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = sql;
-        foreach (var (key, value) in parameters) cmd.Parameters.AddWithValue(key, value ?? DBNull.Value);
+        using var cmd = Command(db, sql);
+        foreach (var (key, value) in parameters) Add(cmd, key, value);
         cmd.ExecuteNonQuery();
     }
     public void Link(string id, string linkId, string url) =>
-        Execute("UPDATE orders SET link_id=$link, hpp_url=$url, updated_at=$now WHERE id=$id",
-            ("$id", id), ("$link", linkId), ("$url", url), ("$now", DateTimeOffset.UtcNow.ToString("O")));
-    public void LinkFailed(string id) => Execute("UPDATE orders SET status='LINK_FAILED' WHERE id=$id", ("$id", id));
+        Execute("UPDATE orders SET link_id=@link, hpp_url=@url, updated_at=@now WHERE id=@id",
+            ("@id", id), ("@link", linkId), ("@url", url), ("@now", DateTimeOffset.UtcNow.ToString("O")));
+    public void LinkFailed(string id) => Execute("UPDATE orders SET status='LINK_FAILED' WHERE id=@id", ("@id", id));
     public void Cancel(string id) =>
         Execute("""
-            UPDATE orders SET cancelled_at=$now, updated_at=$now,
-              status=CASE WHEN status IN ('PAID','AUTHORIZED') THEN status ELSE 'CANCELLED' END WHERE id=$id
-            """, ("$id", id), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+            UPDATE orders SET cancelled_at=@now, updated_at=@now,
+              status=CASE WHEN status IN ('PAID','AUTHORIZED') THEN status ELSE 'CANCELLED' END WHERE id=@id
+            """, ("@id", id), ("@now", DateTimeOffset.UtcNow.ToString("O")));
 
     public void Apply(string id, string next, string transactionId, string gpStatus, string safeResponse)
     {
         // Atomic WHERE prevents out-of-order callbacks from downgrading an approval.
         Execute("""
             UPDATE orders SET
-              status=CASE WHEN $status='PENDING' AND cancelled_at IS NOT NULL THEN 'CANCELLED' ELSE $status END,
-              transaction_id=$transaction, gp_status=$gp, verified_response=$response, updated_at=$now
-            WHERE id=$id AND
-              (CASE status WHEN 'PAID' THEN 3 WHEN 'AUTHORIZED' THEN 2 WHEN 'DECLINED' THEN 1 ELSE 0 END) <= $rank
-            """, ("$id", id), ("$status", next), ("$rank", PaymentRules.Rank(next)),
-            ("$transaction", transactionId), ("$gp", gpStatus), ("$response", safeResponse),
-            ("$now", DateTimeOffset.UtcNow.ToString("O")));
+              status=CASE WHEN @status='PENDING' AND cancelled_at IS NOT NULL THEN 'CANCELLED' ELSE @status END,
+              transaction_id=@transaction, gp_status=@gp, verified_response=@response, updated_at=@now
+            WHERE id=@id AND
+              (CASE status WHEN 'PAID' THEN 3 WHEN 'AUTHORIZED' THEN 2 WHEN 'DECLINED' THEN 1 ELSE 0 END) <= @rank
+            """, ("@id", id), ("@status", next), ("@rank", PaymentRules.Rank(next)),
+            ("@transaction", transactionId), ("@gp", gpStatus), ("@response", safeResponse),
+            ("@now", DateTimeOffset.UtcNow.ToString("O")));
     }
     public void Event(string id, string source, JsonElement payload, bool verified = false) =>
-        Execute("INSERT INTO payment_events (order_id,source,payload,verified,created_at) VALUES ($id,$source,$payload,$verified,$now)",
-            ("$id", id), ("$source", source), ("$payload", JsonSerializer.Serialize(PaymentRules.SafeResponse(payload))),
-            ("$verified", verified ? 1 : 0), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+        Execute("INSERT INTO payment_events (order_id,source,payload,verified,created_at) VALUES (@id,@source,@payload,@verified,@now)",
+            ("@id", id), ("@source", source), ("@payload", JsonSerializer.Serialize(PaymentRules.SafeResponse(payload))),
+            ("@verified", verified ? 1 : 0), ("@now", DateTimeOffset.UtcNow.ToString("O")));
     public object[] Events(string id)
     {
         using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = "SELECT source,payload,verified,created_at FROM payment_events WHERE order_id=$id ORDER BY id";
-        cmd.Parameters.AddWithValue("$id", id);
+        using var cmd = Command(db, "SELECT source,payload,verified,created_at FROM payment_events WHERE order_id=@id ORDER BY id");
+        Add(cmd, "@id", id);
         using var reader = cmd.ExecuteReader();
         var events = new List<object>();
         while (reader.Read()) events.Add(new

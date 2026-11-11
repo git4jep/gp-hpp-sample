@@ -10,5 +10,9 @@ obj/
 !.env.example
 data/
 wwwroot/
+!/client/Merchant.PaymentClient/wwwroot/
 *.sqlite*
 .DS_Store
+.azure-deploy/
+infra/azure/*.local.json
+__pycache__/
