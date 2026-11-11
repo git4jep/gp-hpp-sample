@@ -21,6 +21,8 @@ public static class PaymentCallbackEndpoints
         endpoints.MapMethods("/payments/return/{id}", ["GET", "POST"], HandleReturn);
 
         // Customer browser redirects when canceling checkout on the payment page
+        endpoints.MapMethods("/api/payments/cancel/{id}", ["GET", "POST"], HandleCancel);
+        // Retain the original callback route for already-issued HPP links.
         endpoints.MapMethods("/payments/cancel/{id}", ["GET", "POST"], HandleCancel);
 
         // Asynchronous server-to-server webhook notifications from Global Payments

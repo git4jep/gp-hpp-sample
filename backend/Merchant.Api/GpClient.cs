@@ -63,13 +63,7 @@ public sealed class GpClient(HttpClient http, AppSettings settings)
                 secret = Secret(nonce, settings.AppKey),
                 grant_type = "client_credentials"
             });
-            // var data = await Request("accesstoken", HttpMethod.Post, new JsonObject
-            // {
-            //     ["app_id"] = settings.AppId,
-            //     ["nonce"] = nonce,
-            //     ["secret"] = Secret(nonce, settings.AppKey),
-            //     ["grant_type"] = "client_credentials"
-            // });
+
             if (Text(data, "token") == "" || !data.TryGetProperty("scope", out var scope) ||
                 Text(scope, "merchant_id") != settings.MerchantId)
                 throw new ApiException(502, "Access token scope does not match the configured merchant.");

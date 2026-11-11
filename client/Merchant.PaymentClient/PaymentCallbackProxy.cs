@@ -6,6 +6,7 @@ public static class PaymentCallbackProxy
     {
         // Only provider callback routes are exposed, not admin or arbitrary API routes.
         app.MapMethods("/payments/return/{id}", ["GET", "POST"], Forward).DisableAntiforgery();
+        app.MapMethods("/api/payments/cancel/{id}", ["GET", "POST"], Forward).DisableAntiforgery();
         app.MapMethods("/payments/cancel/{id}", ["GET", "POST"], Forward).DisableAntiforgery();
         app.MapPost("/api/payments/notifications/{id}", Forward).DisableAntiforgery();
     }

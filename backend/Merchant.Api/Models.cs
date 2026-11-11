@@ -21,6 +21,8 @@ public sealed class AppSettings
     public string Country { get; init; } = "US";
     public string AdminKey { get; init; } = "";
     public string DatabasePath { get; init; } = "data/merchant.sqlite";
+    public string DatabaseProvider { get; init; } = "sqlite";
+    public string DatabaseConnectionString { get; init; } = "";
     public string ApiBaseUrl => "https://apis.sandbox.globalpay.com/ucp/";
 
     public string[] AllowedOrigins => [.. LocalDevelopmentOrigins.Prepend(PublicBaseUrl).Distinct(StringComparer.Ordinal)];
@@ -43,8 +45,11 @@ public sealed class AppSettings
             Currency = Env("GP_CURRENCY", "USD"),
             Country = Env("GP_COUNTRY", "US"),
             AdminKey = Env("ADMIN_API_KEY", ""),
-            DatabasePath = Env("DATABASE_PATH", "data/merchant.sqlite")
+            DatabasePath = Env("DATABASE_PATH", "data/merchant.sqlite"),
+            DatabaseProvider = Env("DATABASE_PROVIDER", "sqlite"),
+            DatabaseConnectionString = Env("DATABASE_CONNECTION_STRING", "")
         };
+        s.ValidateDatabase();
         if (s.Mode is not ("demo" or "sandbox")) throw new InvalidOperationException("GP_MODE must be demo or sandbox.");
         foreach (var origin in s.LocalDevelopmentOrigins)
             if (!Uri.TryCreate(origin, UriKind.Absolute, out var local) ||
@@ -61,6 +66,29 @@ public sealed class AppSettings
         if (s.Currency is not ("USD" or "EUR" or "GBP") || !System.Text.RegularExpressions.Regex.IsMatch(s.Country, "^[A-Z]{2}$"))
             throw new InvalidOperationException("Choose USD, EUR, or GBP and a two-letter GP_COUNTRY.");
         return s;
+    }
+
+    public void ValidateDatabase()
+    {
+        if (DatabaseProvider is not ("sqlite" or "sqlserver"))
+            throw new InvalidOperationException("DATABASE_PROVIDER must be sqlite or sqlserver.");
+        if (DatabaseProvider == "sqlite")
+        {
+            if (string.IsNullOrWhiteSpace(DatabasePath))
+                throw new InvalidOperationException("SQLite requires DATABASE_PATH.");
+            return;
+        }
+        try
+        {
+            var options = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(DatabaseConnectionString);
+            if (string.IsNullOrWhiteSpace(options.DataSource) || string.IsNullOrWhiteSpace(options.InitialCatalog))
+                throw new ArgumentException();
+        }
+        catch (ArgumentException)
+        {
+            // Never include the supplied string (which may contain credentials) in diagnostics.
+            throw new InvalidOperationException("SQL Server requires a valid DATABASE_CONNECTION_STRING with Server and Database.");
+        }
     }
 }
 
@@ -121,7 +149,7 @@ public static class PaymentRules
     {
         var suffix = $"{order.Id}?state={order.CallbackKey}";
         return new($"{settings.PublicBaseUrl}/payments/return/{suffix}",
-            $"{settings.PublicBaseUrl}/payments/cancel/{suffix}",
+            $"{settings.PublicBaseUrl}/api/payments/cancel/{suffix}",
             $"{settings.PublicBaseUrl}/api/payments/notifications/{suffix}");
     }
     public static Dictionary<string, string> SafeResponse(JsonElement data)

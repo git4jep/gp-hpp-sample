@@ -175,7 +175,7 @@ public sealed class PaymentTests : IDisposable
         var s = Settings(); var store = new OrderStore(s); var order = NewOrder(store, s);
         var urls = PaymentRules.Urls(s, order);
         Assert.Contains($"/payments/return/{order.Id}?state={order.CallbackKey}", urls.ReturnUrl);
-        Assert.Contains("/payments/cancel/", urls.CancelUrl);
+        Assert.Equal($"{s.PublicBaseUrl}/api/payments/cancel/{order.Id}?state={order.CallbackKey}", urls.CancelUrl);
         Assert.Contains("/api/payments/notifications/", urls.StatusUrl);
         Assert.DoesNotContain(order.AccessKey, urls.ReturnUrl);
     }
@@ -194,7 +194,8 @@ public sealed class PaymentTests : IDisposable
         var body = fake.LastLink;
         Assert.Equal("HOSTED_PAYMENT_PAGE", body.GetProperty("type").GetString());
         Assert.Equal("5600", body.GetProperty("order").GetProperty("amount").GetString());
-        Assert.Contains("/payments/cancel/", body.GetProperty("notifications").GetProperty("cancel_url").GetString());
+        Assert.Equal(PaymentRules.Urls(s, order).CancelUrl,
+            body.GetProperty("notifications").GetProperty("cancel_url").GetString());
         Assert.DoesNotContain(s.AppKey, body.GetRawText());
     }
     [Fact]

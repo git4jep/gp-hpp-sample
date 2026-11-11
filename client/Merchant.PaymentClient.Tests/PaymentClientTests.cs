@@ -75,6 +75,8 @@ public sealed class PaymentClientTests : IDisposable
         Assert.Contains("Choose a test outcome.", demo);
         Assert.Contains("USD 56.00", demo);
         var completed = await api.CompleteDemo(checkout.Order.Id, checkout.OrderKey, outcome);
+        if (outcome == "cancel")
+            Assert.StartsWith($"https://client.example/api/payments/cancel/{checkout.Order.Id}?state=", completed.RedirectUrl);
         using var callback = await browser.GetAsync(new Uri(completed.RedirectUrl).PathAndQuery);
         Assert.Equal(HttpStatusCode.OK, callback.StatusCode);
         Assert.Contains("script-src 'nonce-", callback.Headers.GetValues("Content-Security-Policy").Single());
@@ -148,8 +150,24 @@ public sealed class PaymentClientTests : IDisposable
         var checkout = await api.Checkout("shopper@example.com", "tumbler", 1);
         using var callback = await browser.GetAsync($"/payments/return/{checkout.Order.Id}?state=wrong");
         Assert.Equal(HttpStatusCode.NotFound, callback.StatusCode);
+        using var cancelled = await browser.GetAsync($"/api/payments/cancel/{checkout.Order.Id}?state=wrong");
+        Assert.Equal(HttpStatusCode.NotFound, cancelled.StatusCode);
+        Assert.Equal("PENDING", (await api.GetOrder(checkout.Order.Id, checkout.OrderKey)).Status);
         using var admin = await browser.PostAsync("/api/admin/access-token", null);
         Assert.Equal(HttpStatusCode.MethodNotAllowed, admin.StatusCode);
+    }
+
+    [Fact]
+    public async Task LegacyCancellationLinksStillReachTheCancelPage()
+    {
+        var checkout = await api.Checkout("shopper@example.com", "tumbler", 1);
+        var cancelled = await api.CompleteDemo(checkout.Order.Id, checkout.OrderKey, "cancel");
+        var legacyPath = new Uri(cancelled.RedirectUrl).PathAndQuery.Replace(
+            "/api/payments/cancel/", "/payments/cancel/");
+        using var callback = await browser.GetAsync(legacyPath);
+        Assert.Equal(HttpStatusCode.OK, callback.StatusCode);
+        Assert.Contains("/payment/cancelled?", await callback.Content.ReadAsStringAsync());
+        Assert.Equal("CANCELLED", (await api.GetOrder(checkout.Order.Id, checkout.OrderKey)).Status);
     }
 
     [Fact]
@@ -165,6 +183,14 @@ public sealed class PaymentClientTests : IDisposable
             $"/payment/cancelled?order={checkout.Order.Id}&key={checkout.OrderKey}");
         Assert.Contains("Payment completed.", html);
         Assert.DoesNotContain("Payment cancelled.", html);
+    }
+
+    [Fact]
+    public async Task ReadinessChecksTheApiAndDatabase()
+    {
+        using var response = await browser.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True((await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("ready").GetBoolean());
     }
 
     [Fact]
@@ -186,6 +212,9 @@ public sealed class PaymentClientTests : IDisposable
         var body = await response.Content.ReadAsStringAsync();
         Assert.DoesNotContain("private", body);
         Assert.DoesNotContain("api.internal", body);
+        using var readiness = await unavailable.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, readiness.StatusCode);
+        Assert.False((await readiness.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("ready").GetBoolean());
     }
 
     public void Dispose()

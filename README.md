@@ -1,6 +1,6 @@
 # Northstar Supply — Global Payments HPP sample
 
-A fictitious merchant storefront built with **Angular 22**, an **ASP.NET Core / C# .NET 10 API**, and **SQLite**.
+A fictitious merchant storefront built with **Angular 22**, an **ASP.NET Core / C# .NET 10 API**, and **SQLite or Azure SQL Database**.
 
 An independent **Blazor / C# payment test client** is also available in `client/Merchant.PaymentClient`. It uses the same API and supports the complete HPP return/cancel flow without building or running Angular. See [Blazor payment test client](#blazor-payment-test-client).
 
@@ -11,9 +11,11 @@ The important behavior is a full-page round trip: merchant → Global Payments H
 - [Local setup](#start-immediately-local-demonstration): run immediately without credentials.
 - [Sandbox setup](#actual-global-payments-sandbox): use the actual GP API and public HTTPS callbacks.
 - [Configuration reference](#configuration-reference): environment variables and secret handling.
+- [Payment workflow](#payment-workflow-end-to-end): checkout creation, GP verification, callbacks, order states, and client recovery.
 - [Cancellation workflow](#cancellation-workflow-api-to-merchant-website): HPP cancel callback, order updates, and navigation back to the merchant cancel page.
 - [Deployment guide](docs/DEPLOYMENT.md): release builds, runtime configuration, HTTPS, SQLite storage, verification, and troubleshooting.
 - [Blazor deployment](docs/DEPLOYMENT.md#11-deploy-the-blazor-payment-test-client): separate API/client services, callback forwarding, and WebSocket ingress.
+- [Azure sandbox deployment](docs/DEPLOYMENT.md#12-azure-sql-and-two-azure-app-service-applications): managed-identity SQL access and provisioning/deployment scripts.
 
 ## Requirements
 
@@ -40,10 +42,13 @@ python3 --version
 - `backend/Merchant.Api/Program.cs`: dependency injection, middleware, and endpoint registration.
 - `backend/Merchant.Api/Endpoints/`: configuration, checkout, orders, admin, demo, and HPP callback classes. Edit `PaymentCallbackEndpoints.cs` for return/cancel handling.
 - `backend/Merchant.Api/GpClient.cs`: GP authentication, HPP link creation, and transaction verification.
-- `backend/Merchant.Api/OrderStore.cs`: SQLite persistence.
+- `backend/Merchant.Api/OrderStore.cs`: SQLite/SQL Server persistence.
 - `backend/Merchant.Api/Models.cs`: configuration, request/response types, and payment rules.
 - `backend/Merchant.Api.Tests/`: fake-provider and HTTP integration tests.
 - `scripts/`: hidden-input credential setup and local API launch helpers.
+- `infra/azure/`: Bicep infrastructure and non-secret Azure deployment configuration example.
+- `tools/Merchant.Database/`: operator-only SQL schema initialization and managed-identity grants.
+- `scripts/azure.py`: separate provision, secrets, database, deploy, and verify commands.
 - `.env.example`: non-secret configuration reference; do not put real keys in this file.
 
 ## Blazor payment test client
@@ -81,10 +86,11 @@ The client calls the API server-to-server at `http://127.0.0.1:5080/`. Override 
 The Blazor host forwards only these provider callback routes to the configured API, preserving GET/POST payloads, query strings, status codes, and the API's iframe-breakout HTML/CSP:
 
 - `GET|POST /payments/return/{id}?state=...`
+- `GET|POST /api/payments/cancel/{id}?state=...`
 - `GET|POST /payments/cancel/{id}?state=...`
 - `POST /api/payments/notifications/{id}?state=...`
 
-The API still validates callback state and reconciles sandbox payments against GP. It then navigates to Blazor's `/payment/success`, `/payment/pending`, `/payment/declined`, or `/payment/cancelled` page. `/payment/return` and `/payment/cancel` are also result-page aliases; they need the API-supplied `order` and `key` query parameters. **Do not use these result pages as the provider callback URLs**: provider callbacks must pass through `/payments/...` first.
+The API still validates callback state and reconciles sandbox payments against GP. It then navigates to Blazor's `/payment/success`, `/payment/pending`, `/payment/declined`, or `/payment/cancelled` page. `/payment/return` and `/payment/cancel` are also result-page aliases; they need the API-supplied `order` and `key` query parameters. **Do not use these result pages as the provider callback URLs**: use the API-supplied return/cancel callback URLs instead.
 
 Result pages read the stored order from the API; changing the route cannot fabricate success. **Refresh status** reads current state; **Verify with API** requests reconciliation. An authorization is displayed separately from capture. Keep receipt URLs private.
 
@@ -209,20 +215,103 @@ Set configuration before starting the API, and restart it after changes. `AppSet
 - `GP_COUNTRY`: `US` by default; use a two-letter uppercase country code appropriate to the merchant account.
 - `ADMIN_API_KEY`: private backend administrator bearer key, at least 32 characters. Setup generates it. Without a valid key, all admin routes reject requests.
 - `DATABASE_PATH`: defaults to `data/merchant.sqlite`. The Python helper resolves relative paths from the repository root; direct/published execution resolves them from the process working directory. Use an absolute persistent path for deployment.
+- `DATABASE_PROVIDER`: `sqlite` (default) or `sqlserver`. SQLite retains its existing automatic local schema creation.
+- `DATABASE_CONNECTION_STRING`: required for `sqlserver`, with explicit Server and Database. Azure uses `Authentication=Active Directory Managed Identity;Encrypt=True;TrustServerCertificate=False`. The SQL schema must be initialized separately; the API never runs SQL DDL or silently falls back to SQLite.
 - `ASPNETCORE_URLS`: the helper defaults this to `http://127.0.0.1:5080`. Set it explicitly for published execution; the helper's port default does not apply there.
 - `ASPNETCORE_ENVIRONMENT`: controls ASP.NET hosting behavior, not the GP environment. A deployed service can use `Production` here while retaining `GP_MODE=sandbox`.
 
 Keep `.env` private and out of version control. Setup creates it with owner-only permissions and will not overwrite it. If one already exists, edit it privately rather than copying `.env.example` over it. Never embed `GP_APP_KEY`, `ADMIN_API_KEY`, or GP access tokens in Angular environment files, build arguments, URLs, or committed configuration.
+
+## Payment workflow: end to end
+
+The sandbox flow is **merchant checkout → API-created order and HPP link → GP-hosted payment → API verification → stored order → merchant result page**. Browser return and server-to-server notification are independent paths; neither callback's claimed status is proof of payment.
+
+### 1. Build checkout and persist the order
+
+Angular's `StorefrontComponent` loads `GET /api/config`, builds a cart, and submits product IDs, quantities, and email to `POST /api/checkout` through `MerchantApi.checkout`. Blazor's `Payment.razor` submits the same request server-to-server through `MerchantApiClient.Checkout`.
+
+`CheckoutEndpoints.CreateCheckout` checks any supplied browser Origin against the configured allowlist and validates email. `OrderStore.Create` accepts 1–10 cart entries, each with a known catalog product and quantity of 1–10. It calculates the total from **server-side prices in integer minor units**, then persists a `PENDING` order before contacting GP.
+
+Each order has an `ord_...` reference, its demo/sandbox mode, item snapshots, currency, and two independently generated capabilities:
+
+- `AccessKey`: supplied as `key` to read or reconcile the order and view its receipt.
+- `CallbackKey`: supplied as `state` to provider return, cancel, and notification endpoints.
+
+These keys are excluded from the serialized order object. Checkout returns the access key separately as `orderKey`; callback URLs contain the callback state.
+
+### 2. Create the hosted link and leave the merchant
+
+In sandbox mode, `GpClient.CreateLink` obtains a backend-only access token with `POST /ucp/accesstoken`. Authentication uses the App ID, a random nonce, and SHA-512 of `nonce + App Key`. The token's merchant scope and selected account's `LNK_POST_Create` permission are checked. Tokens are cached in memory and reused while more than one minute of validity remains.
+
+The API then sends `POST /ucp/links` with the order reference, total, currency, payer email, and the three [callback URLs](#return-url-and-cancel-url) derived from `PUBLIC_BASE_URL`. The link is single-use `HOSTED_PAYMENT_PAGE`, card-only/CNP, with automatic capture and `CHALLENGE_PREFERRED` authentication. The API accepts only an `LNK_` link ID and an HTTPS URL on `globalpay.com` or a subdomain.
+
+`OrderStore.Link` persists the link ID and URL. Checkout responds **201** with `order`, `orderKey`, `hppUrl`, and `callbacks`. Angular uses `window.location.assign(hppUrl)`; Blazor uses `Navigation.NavigateTo(hppUrl, forceLoad: true)`. Both perform a full-page navigation to the backend-returned URL. Card entry and any bank/3DS challenge happen on the hosted flow, not the merchant form.
+
+If token acquisition or link creation/validation fails, the persisted order becomes `LINK_FAILED` and checkout returns an error instead of a usable link. There is no checkout idempotency key or automatic link-creation retry; submitting again creates another order.
+
+### 3. Receive browser callbacks or asynchronous notifications
+
+`PaymentCallbackEndpoints.HandleCallback` is the shared pipeline for browser return, browser cancellation, and status notification:
+
+1. Load the order and verify its current mode and query-string `state`; a missing order, wrong mode, or wrong state returns **404**.
+2. Parse the supported JSON/form payload and optional transaction ID hint. A supplied hint must match `TRN_` followed by 1–180 letters, digits, underscores, or hyphens; invalid hints return **400**.
+3. Append an allowlisted callback event. Cancellation also records abandonment before reconciliation; see the [cancellation workflow](#cancellation-workflow-api-to-merchant-website).
+4. In sandbox mode, call `GpClient.Reconcile` against the authenticated GP API. Demo callbacks do not contact GP.
+5. For notifications, return JSON with **200** on successful processing, or **503** when reconciliation raises an `ApiException`, allowing provider delivery to be retried. A successful read with no matching transaction leaves the stored order unchanged and still acknowledges the notification.
+6. For browser callbacks, read the stored order and return **200 HTML** that navigates the top window to the merchant result page, with a manual continuation link. An `ApiException` during verification records `verification-pending` but does not prevent browser navigation.
+
+Browser destinations are `/payment/success` for `PAID`/`AUTHORIZED`; otherwise a cancel callback selects `/payment/cancelled`, while a return selects `/payment/declined` for `DECLINED` or `/payment/pending` for other states. Every destination includes `order` and the separate receipt `key`.
+
+For Angular, the API serves the built application or the development proxy forwards callbacks. For Blazor, `PaymentCallbackProxy` forwards only the provider callback routes to the internal API and relays its status, body, and security headers. `PUBLIC_BASE_URL` must therefore identify the public merchant host that can handle both callbacks and result pages.
+
+### 4. Verify with GP and apply the payment state
+
+With a transaction hint, `GpClient.Reconcile` reads `GET /ucp/transactions/{transactionId}`. Without one, it searches `GET /ucp/transactions` by order reference and account name, requesting up to 100 transactions sorted newest first. It filters responses by transaction ID format, merchant ID, token-scoped account ID, optional account name, exact order reference, amount, currency, and `SALE` type.
+
+A hinted transaction that does not match raises **409**. Matching results are ranked by mapped outcome, and the highest-ranked result is recorded as a verified `gp-api` event and applied to the order:
+
+- `CAPTURED` or `FUNDED` → `PAID`.
+- `PREAUTHORIZED` → `AUTHORIZED` (approval, **not confirmed capture**).
+- `DECLINED` or `REJECTED` → `DECLINED`.
+- Any other GP status → `PENDING`.
+
+`OrderStore.Apply` uses an atomic, rank-guarded database update: `PAID` > `AUTHORIZED` > `DECLINED` > other states. A lower-ranked verification cannot overwrite a higher-ranked stored outcome. Cancellation preserves existing approvals, pending verification preserves recorded cancellation, and a later verified authorization/capture can supersede cancellation. Duplicate callbacks may append events but do not initiate another charge. SQLite and SQL Server use the same transition rules.
+
+### 5. Display the receipt and recover incomplete verification
+
+Result-page paths are presentation hints only. The clients fetch `GET /api/orders/{id}?key=...`; the stored order determines the displayed payment status.
+
+- **Angular:** `ResultComponent` reads the order, immediately calls `POST /api/orders/{id}/reconcile?key=...`, and replaces the result route to match the returned state. While the result stays `PENDING`, it schedules up to five additional checks at five-second intervals. A **Check payment status** button is available for non-approved orders and authorizations. Verification errors are displayed rather than treated as success.
+- **Blazor:** `PaymentResult.razor` initially reads the stored order. **Refresh status** reads it again; **Verify with API** explicitly requests reconciliation. It has no automatic polling.
+- **Without a browser return:** a valid status notification can still update the database. Customer reconciliation or the protected admin reconciliation endpoint can recover a missed update. No automatic background reconciliation worker is included.
+
+### Demo branch and implementation map
+
+In `GP_MODE=demo`, checkout persists the same order but returns a merchant-owned `/demo/checkout/{id}?key=...` URL and `DEMO_` link ID. The simulator posts `success`, `declined`, or `cancel` to `/api/demo/orders/{id}/complete?key=...`. Success/decline directly apply a simulated status and transaction ID; cancellation is recorded by the cancel callback. The simulator returns a callback `redirectUrl`, which the browser follows through the same HTML return flow. Demo reconciliation only reads the stored order; no GP token, link, or transaction API is called.
+
+Trace entry points:
+
+- [Angular storefront, API wrapper, simulator, and result handling](frontend/src/main.ts): `StorefrontComponent.checkout`, `MerchantApi`, `DemoComponent.complete`, `ResultComponent.refresh`.
+- [Checkout endpoint](backend/Merchant.Api/Endpoints/CheckoutEndpoints.cs): `CreateCheckout`.
+- [GP authentication, link creation, and verification](backend/Merchant.Api/GpClient.cs): `GetToken`, `CreateLink`, `Reconcile`, `Matches`.
+- [Callback processing](backend/Merchant.Api/Endpoints/PaymentCallbackEndpoints.cs): `HandleCallback`; [capability checks](backend/Merchant.Api/Endpoints/EndpointGuards.cs): `FindOrder`.
+- [Persistence](backend/Merchant.Api/OrderStore.cs): `Create`, `Link`, `LinkFailed`, `Cancel`, `Apply`, `Event`; [payment rules](backend/Merchant.Api/Models.cs): `PaymentRules`.
+- [Order read/reconciliation](backend/Merchant.Api/Endpoints/OrderEndpoints.cs) and [demo completion](backend/Merchant.Api/Endpoints/DemoEndpoints.cs).
+- [Blazor checkout](client/Merchant.PaymentClient/Components/Pages/Payment.razor), [API client](client/Merchant.PaymentClient/MerchantApiClient.cs), [callback proxy](client/Merchant.PaymentClient/PaymentCallbackProxy.cs), and [receipt](client/Merchant.PaymentClient/Components/PaymentResult.razor).
+
+Existing coverage includes token/link contracts, mismatched transaction rejection, approval-preserving updates, notification-only completion, and demo HTTP round trips in [PaymentTests.cs](backend/Merchant.Api.Tests/PaymentTests.cs); browser success/cancel/decline journeys are in [checkout.spec.ts](frontend/e2e/checkout.spec.ts). These tests use demo/fake-provider behavior, not a live GP sandbox payment.
 
 ## Return URL and cancel URL
 
 For a configured origin `https://your-merchant.example`, each checkout creates these exact URL patterns:
 
 - **Return URL:** `https://your-merchant.example/payments/return/{orderId}?state={randomCallbackKey}`
-- **Cancel URL:** `https://your-merchant.example/payments/cancel/{orderId}?state={randomCallbackKey}`
+- **Gateway cancel URL:** `https://your-merchant.example/api/payments/cancel/{orderId}?state={randomCallbackKey}`
 - **Status notification URL:** `https://your-merchant.example/api/payments/notifications/{orderId}?state={randomCallbackKey}`
 
 These are sent to `POST /ucp/links` under `notifications.return_url`, `notifications.cancel_url`, and `notifications.status_url`, with `type: HOSTED_PAYMENT_PAGE`, single usage, automatic capture, and 3DS challenge preference.
+
+The gateway cancel URL is an API callback, not a client result page. Both clients route it to the API, which validates state, records cancellation, and redirects to `/payment/cancelled` (or success if payment was already verified). Angular's `/api/**` proxy and Blazor's explicit callback forwarding support this route. The original `/payments/cancel/{orderId}` callback remains available for existing HPP links.
 
 Both browser callbacks accept **GET or POST**. Supported POST representations are JSON, URL-encoded fields, or JSON inside a `response`, `hppResponse`, or `hpp_response` form field. Transaction ID hints may be `id`, `TRN_ID`, or the `TRN_ID`/`transaction_id` query parameter.
 
@@ -243,7 +332,7 @@ Cancelling checkout records abandonment. It does **not** reverse a payment, inva
 
 There are two different URLs in this flow:
 
-- **Provider callback:** `/payments/cancel/{orderId}?state={randomCallbackKey}` is an API endpoint, not a UI page.
+- **Provider callback:** `/api/payments/cancel/{orderId}?state={randomCallbackKey}` is an API endpoint, not a UI page. `/payments/cancel/{orderId}` remains a compatibility alias with the same state requirement.
 - **Merchant cancel page:** `/payment/cancelled?order={orderId}&key={orderAccessKey}` is the customer-facing Angular or Blazor page.
 
 The normal round trip is: **merchant checkout → GP HPP → API cancel callback → merchant cancel page**.
@@ -264,16 +353,32 @@ Restart the API after changing `PUBLIC_BASE_URL` and create a new checkout: exis
 
 Implementation references: `backend/Merchant.Api/Endpoints/PaymentCallbackEndpoints.cs`, `backend/Merchant.Api/Endpoints/EndpointGuards.cs`, `backend/Merchant.Api/OrderStore.cs`, and `client/Merchant.PaymentClient/PaymentCallbackProxy.cs`. Automated coverage includes `HttpDemoReturnsToDifferentMerchantPagesAndChecksCapabilities`, `LateCancellationOrDeclineCannotOverwriteVerifiedPayment`, and `ApprovalAfterCancellationIsStillRecordedAndDuplicatesAreIdempotent` in `backend/Merchant.Api.Tests/PaymentTests.cs`.
 
+### Cancellation database behavior
+
+`OrderStore.Cancel(id)` runs before gateway reconciliation and browser navigation. It executes a single parameterized SQL `UPDATE` against the matching order in SQLite or `dbo.orders` in SQL Server/Azure SQL:
+
+- **Status:** `PAID` and `AUTHORIZED` remain unchanged. Every other existing status becomes `CANCELLED`, including `PENDING`, `DECLINED`, and `LINK_FAILED`.
+- **Timestamps:** `cancelled_at` and `updated_at` are set to the same UTC timestamp, including when an approved status is preserved. A non-null `cancelled_at` records a cancellation attempt; it does not prove that no payment completed.
+- **Repeated callbacks:** cancellation does not create another order or charge, but each call overwrites both timestamps with the latest cancellation time. The callback pipeline also records another sanitized audit event.
+- **Persistence:** `ExecuteNonQuery()` applies the update immediately; no separate save call is required. Status and timestamps change atomically in this statement. The callback event is stored separately, not in the same transaction.
+- **Unknown IDs:** calling `Cancel` directly with an unknown ID silently updates zero rows because the method does not check the affected-row count. The HTTP callback first validates order existence, mode, and callback state and returns 404 if validation fails.
+
+Cancellation records checkout abandonment, not a refund, void, or gateway reversal. `OrderStore.Apply` preserves cancellation when a later verified result is still `PENDING`, but allows a verified `AUTHORIZED` or `PAID` result to supersede it. A verified decline may also replace `CANCELLED`. The merchant result page reads the stored status rather than treating the cancel-page URL as authoritative.
+
+`OrderStoreTests.SqliteStoreRetainsThePersistenceContract` covers persisted cancellation, pending reconciliation, later approval, and concurrent cancellation/decline updates after payment. The same persistence contract runs for SQL Server/Azure SQL only when `MERCHANT_TEST_SQL_CONNECTION_STRING` points to a dedicated test database; otherwise that integration test is skipped.
+
 ## Backend API
 
 Public/customer routes:
 
 - `GET /api/config`: merchant name, catalog, currency, and demo/sandbox mode. No credentials.
+- `GET /health/ready`: database connectivity/schema check; Blazor also exposes an API-backed readiness check.
 - `POST /api/checkout`: persist an order, generate/retrieve the provider token internally, create an HPP link, return `hppUrl`, `order`, `orderKey`, and configured callback URLs.
 - `GET /api/orders/{id}?key={orderAccessKey}`: read a capability-protected order.
-- `POST /api/orders/{id}/reconcile?key={orderAccessKey}`: retrieve payment information from GP and update SQLite.
+- `POST /api/orders/{id}/reconcile?key={orderAccessKey}`: retrieve payment information from GP and update the configured database.
 - `GET|POST /payments/return/{id}?state=...`: process browser return, then navigate to the merchant result page.
-- `GET|POST /payments/cancel/{id}?state=...`: process cancellation, then navigate to the merchant result page.
+- `GET|POST /api/payments/cancel/{id}?state=...`: process gateway cancellation, then navigate to the client's cancel page (or success for an already verified approval).
+- `GET|POST /payments/cancel/{id}?state=...`: compatibility alias for existing gateway cancel links.
 - `POST /api/payments/notifications/{id}?state=...`: verify a GP status notification and persist its result; return 503 on provider verification failure so delivery can be retried.
 - `POST /api/demo/orders/{id}/complete?key=...`: explicitly simulated outcomes; disabled outside demo mode.
 
@@ -304,6 +409,8 @@ Token responses contain `accessToken` and `expiresAt`, use `Cache-Control: no-st
 
 ## Persistence and trust
 
+Azure SQL deployments use the same order/event model and approval-preserving updates as SQLite. Follow the [Azure deployment runbook](docs/DEPLOYMENT.md#12-azure-sql-and-two-azure-app-service-applications) to initialize the versioned schema and grant the API identity table-level permissions. Existing local SQLite orders are not automatically imported.
+
 The SQLite file defaults to `data/merchant.sqlite` when launched through the helper. The `orders` table stores totals, items, GP link and transaction IDs, order status, cancellation time, and an allowlisted verified response. `payment_events` stores an append-only record of sanitized callbacks and API verification attempts. This sample does not store card details, payer payloads, raw callback bodies, App Keys, or GP access tokens in SQLite.
 
 Callbacks are **untrusted hints**, even when their random state is correct. The backend reads the transaction via GP's authenticated transaction API and validates:
@@ -320,11 +427,14 @@ Random callback and order-read capabilities are different. Keep callback URLs an
 
 ```sh
 dotnet test Merchant.sln
+python3 -m unittest discover -s scripts/tests -v
 npm run build --prefix frontend
 npm run test:e2e --prefix frontend
 npm audit --prefix frontend
 dotnet list backend/Merchant.Api/Merchant.Api.csproj package --vulnerable --include-transitive
 ```
+
+The SQL Server store integration test is opt-in: set `MERCHANT_TEST_SQL_CONNECTION_STRING` securely to a **dedicated test database** before `dotnet test Merchant.sln`. Without it, the SQL test is explicitly skipped while SQLite and client tests still run. The test initializes schema version 1, inserts random test orders, and removes only its own records. Never point it at a live payment database.
 
 The browser tests start/stop their own local C# host, force demo mode, use a separate database, and verify success/cancel/decline return pages and mobile cart behavior. Keep port 5080 free. They use installed Chrome by default. Without Chrome:
 

@@ -29,9 +29,13 @@ for (const outcome of ["success", "cancel", "declined"]) {
       ).toBeVisible();
       await expect(page.getByText("PAID", { exact: true })).toBeVisible();
     } else if (outcome === "cancel") {
+      const callback = page.waitForRequest((request) =>
+        new URL(request.url()).pathname.startsWith("/api/payments/cancel/"),
+      );
       await page
         .getByRole("button", { name: "Cancel and return to Northstar" })
         .click();
+      expect((await callback).method()).toBe("GET");
       await expect(page).toHaveURL(/\/payment\/cancelled\?/);
       await expect(
         page.getByRole("heading", { name: "Changed your mind?" }),

@@ -4,6 +4,12 @@ namespace Merchant.PaymentClient;
 
 public sealed class MerchantApiClient(HttpClient http)
 {
+    public async Task<bool> IsReady(CancellationToken cancellationToken)
+    {
+        using var response = await http.GetAsync("health/ready", cancellationToken);
+        return response.IsSuccessStatusCode;
+    }
+
     public async Task<MerchantConfig> GetConfig() =>
         await Read<MerchantConfig>(await http.GetAsync("api/config"));
 

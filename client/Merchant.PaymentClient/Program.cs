@@ -38,6 +38,19 @@ public class ClientProgram
         app.UseAntiforgery();
         app.MapStaticAssets();
         app.MapPaymentCallbacks();
+        app.MapGet("/health/ready", async (MerchantApiClient api, HttpContext context) =>
+        {
+            try
+            {
+                return await api.IsReady(context.RequestAborted)
+                    ? Results.Json(new { ready = true })
+                    : Results.Json(new { ready = false }, statusCode: 503);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                return Results.Json(new { ready = false }, statusCode: 503);
+            }
+        });
         app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
         app.Run();
     }

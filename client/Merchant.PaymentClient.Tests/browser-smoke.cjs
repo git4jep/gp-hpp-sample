@@ -43,6 +43,7 @@ function start(project, origin, environment) {
     // Do not load the merchant's private .env or use an existing payment database.
     start('backend/Merchant.Api', apiOrigin, {
       GP_MODE: 'demo', PUBLIC_BASE_URL: clientOrigin,
+      DATABASE_PROVIDER: 'sqlite', DATABASE_CONNECTION_STRING: '',
       DATABASE_PATH: path.join(directory, 'orders.sqlite')
     });
     await waitFor(`${apiOrigin}/api/config`);

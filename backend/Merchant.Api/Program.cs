@@ -63,6 +63,11 @@ app.UseCors("MerchantOrigins");
 app.UseRateLimiter();
 
 app.MapMerchantEndpoints();
+app.MapGet("/health/ready", (OrderStore store) =>
+{
+    store.CheckReadiness();
+    return Results.Ok(new { ready = true });
+});
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
