@@ -135,7 +135,7 @@ GP_MODE=demo PUBLIC_BASE_URL=http://localhost:5080 python3 scripts/run-api.py
 
 Open **http://localhost:5080**. Add products, enter a fictitious email, and continue to checkout. The clearly labeled merchant-owned simulator lets you try success, decline, and cancellation. It is **not the real Global Payments HPP** and makes no GP API calls.
 
-The application uses the exact same backend return/cancel routes in demo and sandbox modes. Demo records carry `mode=demo`, `DEMO_` transaction IDs, and are inaccessible from sandbox routes.
+The application uses the exact same backend return/cancel routes in demo and sandbox modes. Demo records carry `mode=demo` and are inaccessible from sandbox routes. Simulated success or decline assigns a `DEMO_` transaction ID; pending orders and orders that have only been cancelled can have no transaction ID.
 
 ### Angular development server
 
@@ -373,9 +373,9 @@ Public/customer routes:
 
 - `GET /api/config`: merchant name, catalog, currency, and demo/sandbox mode. No credentials.
 - `GET /health/ready`: database connectivity/schema check; Blazor also exposes an API-backed readiness check.
-- `POST /api/checkout`: persist an order, generate/retrieve the provider token internally, create an HPP link, return `hppUrl`, `order`, `orderKey`, and configured callback URLs.
+- `POST /api/checkout`: persist an order and return `hppUrl`, `order`, `orderKey`, and configured callback URLs. Sandbox mode generates/retrieves the provider token internally and creates a GP HPP link; demo mode creates a merchant-owned simulator link without contacting GP.
 - `GET /api/orders/{id}?key={orderAccessKey}`: read a capability-protected order.
-- `POST /api/orders/{id}/reconcile?key={orderAccessKey}`: retrieve payment information from GP and update the configured database.
+- `POST /api/orders/{id}/reconcile?key={orderAccessKey}`: in sandbox mode, retrieve payment information from GP and update the configured database. In demo mode, return the stored order without contacting GP.
 - `GET|POST /payments/return/{id}?state=...`: process browser return, then navigate to the merchant result page.
 - `GET|POST /api/payments/cancel/{id}?state=...`: process gateway cancellation, then navigate to the client's cancel page (or success for an already verified approval).
 - `GET|POST /payments/cancel/{id}?state=...`: compatibility alias for existing gateway cancel links.
@@ -429,19 +429,19 @@ Random callback and order-read capabilities are different. Keep callback URLs an
 dotnet test Merchant.sln
 python3 -m unittest discover -s scripts/tests -v
 npm run build --prefix frontend
-npm run test:e2e --prefix frontend
+DATABASE_PROVIDER=sqlite DATABASE_CONNECTION_STRING= npm run test:e2e --prefix frontend
 npm audit --prefix frontend
 dotnet list backend/Merchant.Api/Merchant.Api.csproj package --vulnerable --include-transitive
 ```
 
 The SQL Server store integration test is opt-in: set `MERCHANT_TEST_SQL_CONNECTION_STRING` securely to a **dedicated test database** before `dotnet test Merchant.sln`. Without it, the SQL test is explicitly skipped while SQLite and client tests still run. The test initializes schema version 1, inserts random test orders, and removes only its own records. Never point it at a live payment database.
 
-The browser tests start/stop their own local C# host, force demo mode, use a separate database, and verify success/cancel/decline return pages and mobile cart behavior. Keep port 5080 free. They use installed Chrome by default. Without Chrome:
+The Angular browser tests start/stop their own local C# host, force demo mode, and set `DATABASE_PATH=data/e2e.sqlite`. They verify success/cancel/decline return pages and mobile cart behavior. The Playwright configuration does **not** override `DATABASE_PROVIDER` or `DATABASE_CONNECTION_STRING`; use the explicit SQLite overrides in the command above so inherited environment variables or root `.env` settings cannot select an existing SQL Server database instead. Keep port 5080 free. They use installed Chrome by default. Without Chrome:
 
 ```sh
 cd frontend
 npx playwright install chromium
-PLAYWRIGHT_CHANNEL=chromium npm run test:e2e
+DATABASE_PROVIDER=sqlite DATABASE_CONNECTION_STRING= PLAYWRIGHT_CHANNEL=chromium npm run test:e2e
 ```
 
 For single-origin publishing, build Angular **before** publishing the API so `wwwroot` is included:
