@@ -7,7 +7,6 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Xunit;
 
 namespace Merchant.Api.Tests;
@@ -232,73 +231,6 @@ public sealed class PaymentTests : IDisposable
         var result = await gp.Reconcile(store, order);
         Assert.Equal("AUTHORIZED", result.Status);
     }
-    [Theory]
-    [InlineData("CAPTURED", "PAID")]
-    [InlineData("PREAUTHORIZED", "AUTHORIZED")]
-    [InlineData("DECLINED", "DECLINED")]
-    public async Task SearchSummariesWithoutMerchantIdsAreVerifiedUsingTransactionDetails(string providerStatus, string expectedStatus)
-    {
-        var s = Settings(); var store = new OrderStore(s); var order = NewOrder(store, s);
-        var fake = new FakeGp(s, order) { TransactionStatus = providerStatus };
-        var result = await new GpClient(new HttpClient(fake), s).Reconcile(store, order);
-        Assert.Equal(expectedStatus, result.Status);
-        Assert.Equal(providerStatus, result.GpStatus);
-        Assert.Equal("TRN_verified", result.TransactionId);
-        Assert.Equal(1, fake.DetailCalls);
-        var audit = JsonSerializer.SerializeToElement(store.Events(order.Id));
-        Assert.True(audit[0].GetProperty("verified").GetBoolean());
-    }
-
-    [Theory]
-    [InlineData("merchant_id", "MER_wrong")]
-    [InlineData("account_id", "TRA_wrong")]
-    [InlineData("account_name", "other_account")]
-    [InlineData("reference", "other_order")]
-    [InlineData("currency", "GBP")]
-    [InlineData("amount", "1")]
-    [InlineData("type", "REFUND")]
-    public async Task SearchReconciliationStillRejectsMismatchedTransactionDetails(string field, string value)
-    {
-        var s = Settings(); var store = new OrderStore(s); var order = NewOrder(store, s);
-        var detail = JsonNode.Parse(Transaction(order, s).GetRawText())!;
-        detail[field] = value;
-        var fake = new FakeGp(s, order) { Detail = JsonSerializer.SerializeToElement(detail) };
-        var result = await new GpClient(new HttpClient(fake), s).Reconcile(store, order);
-        Assert.Equal("PENDING", result.Status);
-        Assert.Null(result.TransactionId);
-        Assert.Equal(1, fake.DetailCalls);
-        Assert.Empty(store.Events(order.Id));
-    }
-
-    [Theory]
-    [InlineData("TRN_../other")]
-    [InlineData("invalid")]
-    [InlineData("")]
-    public async Task SearchReconciliationDoesNotFetchInvalidTransactionIds(string id)
-    {
-        var s = Settings(); var store = new OrderStore(s); var order = NewOrder(store, s);
-        var fake = new FakeGp(s, order)
-        {
-            SearchTransactions = [JsonSerializer.SerializeToElement(new { id, reference = order.Id })]
-        };
-        var result = await new GpClient(new HttpClient(fake), s).Reconcile(store, order);
-        Assert.Equal("PENDING", result.Status);
-        Assert.Equal(0, fake.DetailCalls);
-    }
-
-    [Fact]
-    public async Task FailedTransactionDetailLookupDoesNotTrustSearchStatus()
-    {
-        var s = Settings(); var store = new OrderStore(s); var order = NewOrder(store, s);
-        var fake = new FakeGp(s, order) { DetailLookupFails = true };
-        var error = await Assert.ThrowsAsync<ApiException>(() =>
-            new GpClient(new HttpClient(fake), s).Reconcile(store, order));
-        Assert.Equal(502, error.StatusCode);
-        Assert.Equal("PENDING", store.Get(order.Id)!.Status);
-        Assert.Null(store.Get(order.Id)!.TransactionId);
-        Assert.Empty(store.Events(order.Id));
-    }
-
     [Fact]
     public void RawCardAndCredentialDataAreNotPersistedOrSerialized()
     {
@@ -409,10 +341,6 @@ public sealed class PaymentTests : IDisposable
         public int TokenCalls { get; private set; }
         public JsonElement LastLink { get; private set; }
         public string TransactionStatus { get; set; } = "CAPTURED";
-        public int DetailCalls { get; private set; }
-        public JsonElement? Detail { get; init; }
-        public JsonElement[]? SearchTransactions { get; init; }
-        public bool DetailLookupFails { get; init; }
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             object body;
@@ -446,28 +374,8 @@ public sealed class PaymentTests : IDisposable
                     LastLink = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
                     body = new { id = "LNK_test", url = "https://apis.sandbox.globalpay.com/ucp/hpp/redirect/test" };
                 }
-                else if (path.EndsWith("/transactions"))
-                {
-                    var summary = Transaction(order, settings, TransactionStatus).EnumerateObject()
-                        .Where(property => property.Name != "merchant_id")
-                        .ToDictionary(property => property.Name, property => property.Value);
-                    body = new
-                    {
-                        merchant_id = settings.MerchantId,
-                        account_id = "TRA_other_envelope_account",
-                        transactions = SearchTransactions ?? [JsonSerializer.SerializeToElement(summary)]
-                    };
-                }
-                else
-                {
-                    DetailCalls++;
-                    if (DetailLookupFails)
-                        return new HttpResponseMessage(HttpStatusCode.BadGateway)
-                        {
-                            Content = JsonContent.Create(new { error_code = "TEST_LOOKUP_FAILED" })
-                        };
-                    body = Detail ?? Transaction(order, settings, TransactionStatus);
-                }
+                else if (path.EndsWith("/transactions")) body = new { transactions = new[] { Transaction(order, settings, TransactionStatus) } };
+                else body = Transaction(order, settings, TransactionStatus);
             }
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) };
         }

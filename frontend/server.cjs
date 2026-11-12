@@ -7,7 +7,6 @@ const { pipeline } = require("node:stream");
 const root = path.resolve(__dirname, "browser");
 const api = new URL(process.env.API_BASE_URL);
 const publicOrigin = new URL(process.env.PUBLIC_ORIGIN).origin;
-const apiPublicOrigin = new URL(process.env.API_PUBLIC_ORIGIN || api.origin).origin;
 if (api.protocol !== "https:" && api.hostname !== "127.0.0.1") {
   throw new Error("API_BASE_URL must use HTTPS.");
 }
@@ -52,7 +51,7 @@ http.createServer((req, res) => {
         !["host", "authorization", "cookie", "forwarded", "referer"].includes(name) &&
         !name.startsWith("x-forwarded-")));
     headers.host = api.host;
-    if (headers.origin) headers.origin = apiPublicOrigin;
+    if (headers.origin) headers.origin = api.origin;
     const transport = api.protocol === "https:" ? https : http;
     const upstream = transport.request({
       protocol: api.protocol, hostname: api.hostname, port: api.port,
