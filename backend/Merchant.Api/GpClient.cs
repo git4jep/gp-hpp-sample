@@ -131,8 +131,18 @@ public sealed class GpClient(HttpClient http, AppSettings settings)
         else
         {
             var data = await Authenticated($"transactions?reference={Uri.EscapeDataString(order.Id)}&account_name={Uri.EscapeDataString(settings.AccountName)}&page_size=100&order=DESC&order_by=TIME_CREATED", HttpMethod.Get);
-            transactions = data.TryGetProperty("transactions", out var list) && list.ValueKind == JsonValueKind.Array
-                ? list.EnumerateArray().ToList() : [];
+            transactions = [];
+            if (data.TryGetProperty("transactions", out var list) && list.ValueKind == JsonValueKind.Array)
+            {
+                // Search summaries can omit merchant_id. Verify the complete authenticated record,
+                // not callback claims or the list envelope's potentially different account metadata.
+                var ids = list.EnumerateArray().Where(t => Text(t, "reference") == order.Id)
+                    .Select(t => Text(t, "id"))
+                    .Where(id => Regex.IsMatch(id, "^TRN_[A-Za-z0-9_-]{1,180}$"))
+                    .Distinct(StringComparer.Ordinal);
+                foreach (var id in ids)
+                    transactions.Add(await Authenticated($"transactions/{Uri.EscapeDataString(id)}", HttpMethod.Get));
+            }
         }
         var verified = transactions.Where(t => Matches(t, order, settings, token.AccountId))
             .OrderByDescending(t => PaymentRules.Rank(PaymentRules.Outcome(Text(t, "status")))).ToList();
