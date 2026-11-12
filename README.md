@@ -12,6 +12,7 @@ The important behavior is a full-page round trip: merchant → Global Payments H
 - [Sandbox setup](#actual-global-payments-sandbox): use the actual GP API and public HTTPS callbacks.
 - [Configuration reference](#configuration-reference): environment variables and secret handling.
 - [Payment workflow](#payment-workflow-end-to-end): checkout creation, GP verification, callbacks, order states, and client recovery.
+- [Callback security](#callback-security-considerations): trust boundaries, capability URLs, replay handling, safe navigation, and deployment requirements.
 - [Cancellation workflow](#cancellation-workflow-api-to-merchant-website): HPP cancel callback, order updates, and navigation back to the merchant cancel page.
 - [Deployment guide](docs/DEPLOYMENT.md): release builds, runtime configuration, HTTPS, SQLite storage, verification, and troubleshooting.
 - [Blazor deployment](docs/DEPLOYMENT.md#11-deploy-the-blazor-payment-test-client): separate API/client services, callback forwarding, and WebSocket ingress.
@@ -226,6 +227,17 @@ Keep `.env` private and out of version control. Setup creates it with owner-only
 
 The sandbox flow is **merchant checkout → API-created order and HPP link → GP-hosted payment → API verification → stored order → merchant result page**. Browser return and server-to-server notification are independent paths; neither callback's claimed status is proof of payment.
 
+Workflow at a glance:
+
+1. The client loads the catalog and submits product IDs, quantities, and email to `POST /api/checkout`.
+2. The API calculates server-side totals, persists a `PENDING` order, and creates a GP HPP link using backend-only credentials.
+3. The browser navigates to the validated hosted link; card entry and any 3DS challenge happen on the provider's flow.
+4. Return, cancellation, and notification callbacks validate order state and trigger authenticated transaction verification.
+5. The API persists the verified outcome using approval-preserving updates. Cancellation records abandonment, not a refund or void.
+6. Browser callbacks navigate to the merchant receipt. The stored order, not the result-page URL, determines the displayed outcome; reconciliation can recover incomplete verification.
+
+Demo mode exercises the local callback round trip without GP API calls. See [callback security](#callback-security-considerations) for the safeguards and remaining limitations behind this workflow.
+
 ### 1. Build checkout and persist the order
 
 Angular's `StorefrontComponent` loads `GET /api/config`, builds a cart, and submits product IDs, quantities, and email to `POST /api/checkout` through `MerchantApi.checkout`. Blazor's `Payment.razor` submits the same request server-to-server through `MerchantApiClient.Checkout`.
@@ -422,6 +434,52 @@ Callbacks are **untrusted hints**, even when their random state is correct. The 
 Database updates are atomic and prevent a late pending, declined, or cancellation callback from downgrading an approved/captured payment. Duplicate callbacks can add audit events but do not create another order or charge. If the customer closes their browser, `status_url` still provides a server-to-server path to update the order. Explicit reconciliation is available when delivery is missed; an automatic background reconciliation worker is not included.
 
 Random callback and order-read capabilities are different. Keep callback URLs and receipt URLs private, redact query strings in tunnel/reverse-proxy logs, and do not include third-party analytics on receipt pages. ASP.NET request logging is suppressed for these paths, referrers are disabled, requests are size-limited, token APIs are protected, and endpoints are rate-limited. A callback state is not claimed to be a GP signature; payment authenticity comes from the authenticated GP readback.
+
+## Callback security considerations
+
+These controls describe the current sample, not a production certification. The handlers are Minimal API endpoints in `backend/Merchant.Api/Endpoints/PaymentCallbackEndpoints.cs`, with capability checks in `Endpoints/EndpointGuards.cs`, provider verification in `GpClient.cs`, and database transitions in `OrderStore.cs`.
+
+### Callback trust and transaction verification
+
+Treat every callback body and transaction ID as untrusted input. A correct callback `state` permits processing but is **not a GP signature or proof of sender identity**. CORS and browser Origin checks are not provider authentication.
+
+In sandbox mode, payment evidence comes from the authenticated GP transaction API. Before applying an outcome, `GpClient.Matches` checks transaction ID format, configured merchant ID, token-scoped account ID, account name when present, exact order reference, amount, currency, and `SALE` type. Callback status fields and result-page route names cannot establish approval. `AUTHORIZED` is not confirmed capture.
+
+### Capability URLs and confidentiality
+
+Each order has independently generated 24-byte random keys: `CallbackKey` is supplied as `state`; `AccessKey` is supplied as `key` for receipt reads and customer reconciliation. `FindOrder` validates the current mode and compares keys using `CryptographicOperations.FixedTimeEquals`; unknown orders, wrong modes, and invalid keys return 404.
+
+These are bearer capabilities, not customer/session authentication. They have no implemented expiry or rotation policy. Although the keys are separate, a valid browser callback returns a continuation URL containing the receipt key: possession of callback state can therefore expose receipt access as well as permit cancellation processing. Do not treat the two URLs as isolated confidentiality boundaries.
+
+Use public HTTPS for sandbox callbacks. Keep callback and receipt URLs out of tickets, screenshots, analytics, and shared logs. Responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; ASP.NET logging is filtered to Warning. These controls do not remove URLs from browser history or protect reverse-proxy, tunnel, telemetry, or custom logs. Redact query strings in those systems and avoid third-party analytics on receipt pages.
+
+### Input and browser-response controls
+
+The callback parser accepts JSON objects, form fields, and JSON wrapped in `response`, `hppResponse`, or `hpp_response`. Supplied transaction hints must match `TRN_` followed by 1–180 letters, digits, underscores, or hyphens. Kestrel limits request bodies to 32 KB. These checks constrain input but do not authenticate it.
+
+Browser destinations are built from validated `PUBLIC_BASE_URL`, an internally selected result page, and the stored order; the handler does not accept arbitrary redirect destinations. It HTML-encodes the continuation link and JSON-serializes the script destination. The HTTP 200 HTML response uses a random CSP script nonce, `default-src 'none'`, and framing restricted to the specified GP domains. Top-window navigation has a current-window fallback and a manual link; actual browser/HPP navigation still needs sandbox verification.
+
+### Replay, ordering, and cancellation
+
+Duplicate callbacks do not initiate another charge. Atomic, rank-guarded updates prevent a lower-ranked verified outcome from overwriting `AUTHORIZED` or `PAID`; cancellation also preserves approvals. A later verified approval can supersede cancellation.
+
+This is not full replay protection: callbacks can be reused, append audit events, trigger GP requests, and overwrite cancellation timestamps. Callback event insertion and order updates are separate database operations, not one transaction. Cancellation does not invalidate the HPP link or reverse an in-flight payment. The sample's rank policy does not model refunds, reversals, or authorization expiry.
+
+### Verification failures and operational recovery
+
+A reconciliation `ApiException` records `verification-pending`. Notifications return 503 so delivery can be retried; browser callbacks still return to the merchant using stored state. A successful GP search with no matching transaction leaves the order unchanged and acknowledges the notification with 200. Other exceptions use the API's general error handling; not every failure receives this retry response.
+
+No durable notification queue or background reconciliation worker is included. Use customer/admin reconciliation to recover missed updates. In production, add durable delivery processing, background recovery, and alerts for verification failures, unmatched transactions, and sustained pending orders.
+
+### Rate limiting, persistence, and production requirements
+
+Callbacks share the general fixed-window limit of 180 requests per minute per `RemoteIpAddress`, with 429 responses and no queue. Configure trusted proxy/client-IP handling and callback-aware limits before deployment so a shared ingress address or provider retry burst does not block legitimate notifications.
+
+Only allowlisted callback/verification fields are persisted; raw payloads and card data are not stored by this flow. Sanitize telemetry as well, protect database access/backups, and define retention. Keep GP credentials backend-only and protect the separate administrator token endpoints.
+
+Before production use, add customer-bound order authorization, capability lifecycle management, checkout idempotency, replay/abuse monitoring, durable retries, and refund/reversal handling. Validate any additional provider-authentication mechanism against the actual GP account contract rather than assuming one exists in this sample.
+
+**Verification scope:** demo and fake-provider tests exercise local behavior, not live GP sender identity, callback delivery/retries, HPP framing, cancellation, or bank/3DS behavior. Complete a real sandbox run before relying on those integrations.
 
 ## Tests and build
 
